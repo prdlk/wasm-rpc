@@ -3,8 +3,8 @@
 
 package ticker.v1
 
-import dev.hyperauth.wasmrpc.WasmRpcStreamTransport
-import dev.hyperauth.wasmrpc.WasmRpcTransport
+import dev.prdlk.wasmrpc.WasmRpcStreamTransport
+import dev.prdlk.wasmrpc.WasmRpcTransport
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.map
 

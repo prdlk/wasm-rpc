@@ -3,7 +3,7 @@
 
 package echo.v1
 
-import dev.hyperauth.wasmrpc.WasmRpcTransport
+import dev.prdlk.wasmrpc.WasmRpcTransport
 
 /** Typed wasm-rpc client for `echo.v1.EchoService`. */
 class EchoServiceClient(private val transport: WasmRpcTransport) {

@@ -1420,7 +1420,7 @@ public final class Ticker extends com.google.protobuf.GeneratedFile {
       "x_millis\030\003 \001(\003R\nunixMillis2Y\n\rTickerServ" +
       "ice\022H\n\tSubscribe\022\033.ticker.v1.SubscribeRe" +
       "quest\032\034.ticker.v1.SubscribeResponse0\001B9Z" +
-      "7github.com/hyperauth/wasm-rpc/gen/go/ti" +
+      "7github.com/prdlk/wasm-rpc/gen/go/ti" +
       "cker/v1;tickerv1b\006proto3"
     };
     descriptor = com.google.protobuf.Descriptors.FileDescriptor

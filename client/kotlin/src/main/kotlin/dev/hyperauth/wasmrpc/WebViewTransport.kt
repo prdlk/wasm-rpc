@@ -1,4 +1,4 @@
-package dev.hyperauth.wasmrpc
+package dev.prdlk.wasmrpc
 
 /**
  * Reference sketch for Android: bridge into a WebView hosting the Go

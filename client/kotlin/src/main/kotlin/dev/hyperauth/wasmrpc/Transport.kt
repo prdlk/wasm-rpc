@@ -1,4 +1,4 @@
-package dev.hyperauth.wasmrpc
+package dev.prdlk.wasmrpc
 
 import kotlinx.coroutines.flow.Flow
 
