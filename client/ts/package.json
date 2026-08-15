@@ -1,5 +1,5 @@
 {
-  "name": "@hyperauth/wasm-rpc-client",
+  "name": "@prdlk/wasm-rpc-client",
   "version": "0.1.0",
   "type": "module",
   "exports": {
