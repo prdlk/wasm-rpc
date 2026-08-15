@@ -6,7 +6,7 @@ package wasmrpcclient
 import (
 	"context"
 
-	"github.com/hyperauth/wasm-rpc/server"
+	"github.com/prdlk/wasm-rpc/server"
 )
 
 // Transport moves opaque protobuf frames to a wasm-rpc router.
