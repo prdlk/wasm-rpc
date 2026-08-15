@@ -1,0 +1,7 @@
+name: wasm_rpc_client
+description: Dart client runtime for wasm-rpc (Protobuf over a Go Wasm host).
+version: 0.1.0
+environment:
+  sdk: ^3.4.0
+dependencies:
+  protobuf: ^4.0.0
