@@ -1,0 +1,27 @@
+{
+  "name": "@hyperauth/wasm-rpc-client",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    },
+    "./gen/*": {
+      "types": "./dist/gen/*",
+      "default": "./dist/gen/*"
+    }
+  },
+  "files": ["dist", "src", "gen"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@bufbuild/protobuf": "^2.2.3"
+  },
+  "devDependencies": {
+    "@bufbuild/protoc-gen-es": "^2.2.3",
+    "typescript": "^5.7.3"
+  }
+}
