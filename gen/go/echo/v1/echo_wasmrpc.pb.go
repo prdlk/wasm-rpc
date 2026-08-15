@@ -5,8 +5,8 @@ package echov1
 
 import (
 	context "context"
-	_go "github.com/hyperauth/wasm-rpc/client/go"
-	server "github.com/hyperauth/wasm-rpc/server"
+	_go "github.com/prdlk/wasm-rpc/client/go"
+	server "github.com/prdlk/wasm-rpc/server"
 	proto "google.golang.org/protobuf/proto"
 )
 
