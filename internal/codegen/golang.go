@@ -7,8 +7,8 @@ import (
 )
 
 var (
-	serverPkg  = protogen.GoImportPath("github.com/hyperauth/wasm-rpc/server")
-	clientPkg  = protogen.GoImportPath("github.com/hyperauth/wasm-rpc/client/go")
+	serverPkg  = protogen.GoImportPath("github.com/prdlk/wasm-rpc/server")
+	clientPkg  = protogen.GoImportPath("github.com/prdlk/wasm-rpc/client/go")
 	contextPkg = protogen.GoImportPath("context")
 	protoPkg   = protogen.GoImportPath("google.golang.org/protobuf/proto")
 )

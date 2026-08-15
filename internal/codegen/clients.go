@@ -210,12 +210,12 @@ func genKotlin(p *protogen.Plugin, f *protogen.File) error {
 		g.P()
 	}
 	if hasServerStream(f) {
-		g.P("import dev.hyperauth.wasmrpc.WasmRpcStreamTransport")
-		g.P("import dev.hyperauth.wasmrpc.WasmRpcTransport")
+		g.P("import dev.prdlk.wasmrpc.WasmRpcStreamTransport")
+		g.P("import dev.prdlk.wasmrpc.WasmRpcTransport")
 		g.P("import kotlinx.coroutines.flow.Flow")
 		g.P("import kotlinx.coroutines.flow.map")
 	} else {
-		g.P("import dev.hyperauth.wasmrpc.WasmRpcTransport")
+		g.P("import dev.prdlk.wasmrpc.WasmRpcTransport")
 	}
 	g.P()
 
