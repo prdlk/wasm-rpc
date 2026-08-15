@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package echo.v1;
+
+option go_package = "github.com/hyperauth/wasm-rpc/gen/go/echo/v1;echov1";
+
+// EchoService is a generic service used to validate the full
+// client -> Wasm -> Go -> Wasm -> client pipeline.
+service EchoService {
+  // Echo returns the message, optionally repeated.
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  // Reverse returns the message reversed (rune-safe).
+  rpc Reverse(ReverseRequest) returns (ReverseResponse);
+}
+
+message EchoRequest {
+  string message = 1;
+  // If > 1, the message is repeated N times.
+  uint32 repeat = 2;
+}
+
+message EchoResponse {
+  string message = 1;
+  // Server-side timestamp (unix millis) proving the response was
+  // produced inside the Go handler.
+  int64 unix_millis = 2;
+}
+
+message ReverseRequest {
+  string message = 1;
+}
+
+message ReverseResponse {
+  string message = 1;
+  int64 unix_millis = 2;
+}
+

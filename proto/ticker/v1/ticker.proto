@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package ticker.v1;
+
+option go_package = "github.com/hyperauth/wasm-rpc/gen/go/ticker/v1;tickerv1";
+
+// TickerService demonstrates server-streaming over wasm-rpc: one
+// request in, a paced sequence of responses out, cancellable from the
+// client at any time.
+service TickerService {
+  // Subscribe emits `count` ticks for a topic, one every
+  // `interval_ms` milliseconds.
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
+
+message SubscribeRequest {
+  string topic = 1;
+  // Number of ticks to emit; defaults to 3 when 0. Max 10000.
+  uint32 count = 2;
+  // Pace between ticks; defaults to 1ms when 0. Max 10000.
+  uint32 interval_ms = 3;
+}
+
+message SubscribeResponse {
+  string topic = 1;
+  uint32 seq = 2;
+  int64 unix_millis = 3;
+}
