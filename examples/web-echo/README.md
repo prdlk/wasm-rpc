@@ -32,7 +32,7 @@ make server-tinygo && npm run dev   # ~1.2 MB module instead of ~6.4 MB
    decode. Handler errors reject as `WasmRpcError{code, method,
    message}` — the "Trigger typed error" button demonstrates it.
 
-The npm dependency `@hyperauth/wasm-rpc-client` is a `file:` link to
+The npm dependency `@prdlk/wasm-rpc-client` is a `file:` link to
 `client/ts`, which contains both the runtime and the buf-generated
 clients — regenerating the schema (`buf generate` at the repo root)
 flows into this app on the next build.

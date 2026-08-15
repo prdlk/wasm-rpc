@@ -5,10 +5,10 @@ import (
 	"errors"
 	"testing"
 
-	wasmrpcclient "github.com/hyperauth/wasm-rpc/client/go"
-	streaming "github.com/hyperauth/wasm-rpc/examples/server-streaming"
-	tickerv1 "github.com/hyperauth/wasm-rpc/gen/go/ticker/v1"
-	"github.com/hyperauth/wasm-rpc/server"
+	wasmrpcclient "github.com/prdlk/wasm-rpc/client/go"
+	streaming "github.com/prdlk/wasm-rpc/examples/server-streaming"
+	tickerv1 "github.com/prdlk/wasm-rpc/gen/go/ticker/v1"
+	"github.com/prdlk/wasm-rpc/server"
 )
 
 func newClient() *tickerv1.TickerServiceClient {

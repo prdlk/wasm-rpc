@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	echov1 "github.com/hyperauth/wasm-rpc/gen/go/echo/v1"
-	"github.com/hyperauth/wasm-rpc/server"
+	echov1 "github.com/prdlk/wasm-rpc/gen/go/echo/v1"
+	"github.com/prdlk/wasm-rpc/server"
 )
 
 // Service implements echov1.EchoServiceServer.

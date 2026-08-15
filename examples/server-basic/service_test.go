@@ -5,10 +5,10 @@ import (
 	"errors"
 	"testing"
 
-	wasmrpcclient "github.com/hyperauth/wasm-rpc/client/go"
-	basic "github.com/hyperauth/wasm-rpc/examples/server-basic"
-	echov1 "github.com/hyperauth/wasm-rpc/gen/go/echo/v1"
-	"github.com/hyperauth/wasm-rpc/server"
+	wasmrpcclient "github.com/prdlk/wasm-rpc/client/go"
+	basic "github.com/prdlk/wasm-rpc/examples/server-basic"
+	echov1 "github.com/prdlk/wasm-rpc/gen/go/echo/v1"
+	"github.com/prdlk/wasm-rpc/server"
 )
 
 // Exercises the generated Go client + Register glue over the loopback

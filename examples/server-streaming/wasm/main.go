@@ -8,9 +8,9 @@ package main
 import (
 	"syscall/js"
 
-	streaming "github.com/hyperauth/wasm-rpc/examples/server-streaming"
-	tickerv1 "github.com/hyperauth/wasm-rpc/gen/go/ticker/v1"
-	"github.com/hyperauth/wasm-rpc/server"
+	streaming "github.com/prdlk/wasm-rpc/examples/server-streaming"
+	tickerv1 "github.com/prdlk/wasm-rpc/gen/go/ticker/v1"
+	"github.com/prdlk/wasm-rpc/server"
 )
 
 func main() {

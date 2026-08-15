@@ -16,8 +16,8 @@ import (
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 	"google.golang.org/protobuf/proto"
 
-	echov1 "github.com/hyperauth/wasm-rpc/gen/go/echo/v1"
-	tickerv1 "github.com/hyperauth/wasm-rpc/gen/go/ticker/v1"
+	echov1 "github.com/prdlk/wasm-rpc/gen/go/echo/v1"
+	tickerv1 "github.com/prdlk/wasm-rpc/gen/go/ticker/v1"
 )
 
 const (

@@ -7,8 +7,8 @@ import (
 	"context"
 	"time"
 
-	tickerv1 "github.com/hyperauth/wasm-rpc/gen/go/ticker/v1"
-	"github.com/hyperauth/wasm-rpc/server"
+	tickerv1 "github.com/prdlk/wasm-rpc/gen/go/ticker/v1"
+	"github.com/prdlk/wasm-rpc/server"
 )
 
 // Service implements tickerv1.TickerServiceServer.

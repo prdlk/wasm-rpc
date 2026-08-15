@@ -6,8 +6,8 @@ import {
   loadWasmRpc,
   WasmRpcError,
   type WasmRpcStream,
-} from "@hyperauth/wasm-rpc-client";
-import { TickerServiceClient } from "@hyperauth/wasm-rpc-client/gen/ticker/v1/ticker_wasmrpc.pb.js";
+} from "@prdlk/wasm-rpc-client";
+import { TickerServiceClient } from "@prdlk/wasm-rpc-client/gen/ticker/v1/ticker_wasmrpc.pb.js";
 
 type Tick = { topic: string; seq: number; unixMillis: bigint };
 

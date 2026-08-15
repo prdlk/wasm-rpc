@@ -6,8 +6,8 @@ import {
   loadWasmRpc,
   WasmRpcError,
   type WasmRpcTransport,
-} from "@hyperauth/wasm-rpc-client";
-import { EchoServiceClient } from "@hyperauth/wasm-rpc-client/gen/echo/v1/echo_wasmrpc.pb.js";
+} from "@prdlk/wasm-rpc-client";
+import { EchoServiceClient } from "@prdlk/wasm-rpc-client/gen/echo/v1/echo_wasmrpc.pb.js";
 
 type Entry = { kind: "ok" | "err"; text: string };
 
