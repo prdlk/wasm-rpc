@@ -1,0 +1,13 @@
+.crush
+node_modules/
+build/
+bin/
+dist/
+client/ts/dist/
+examples/e2e/app.wasm
+examples/e2e/wasm_exec.js
+examples/web-echo/public/server.wasm
+examples/web-echo/public/wasm_exec.js
+examples/web-streaming/public/server.wasm
+examples/web-streaming/public/wasm_exec.js
+*.tsbuildinfo

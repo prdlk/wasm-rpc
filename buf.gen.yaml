@@ -1,0 +1,38 @@
+version: v2
+clean: true
+plugins:
+  # --- message stubs ---------------------------------------------------
+  - local: protoc-gen-go
+    out: gen/go
+    opt: paths=source_relative
+  - local: [go, tool, protoc-gen-go-vtproto]
+    out: gen/go
+    opt: [paths=source_relative, features=marshal+unmarshal+size]
+  - local: client/ts/node_modules/.bin/protoc-gen-es
+    out: client/ts/gen
+    opt: target=ts
+  - remote: buf.build/protocolbuffers/dart
+    out: client/dart/lib/gen
+  - remote: buf.build/protocolbuffers/java
+    out: client/kotlin/gen/java
+  - remote: buf.build/protocolbuffers/kotlin
+    out: client/kotlin/gen/kotlin
+  - remote: buf.build/apple/swift
+    out: client/swift/Sources/WasmRpcGen
+    opt: Visibility=Public
+  # --- wasm-rpc bindings (protogen-wasm) -------------------------------
+  - local: [go, run, ./cmd/protogen-wasm]
+    out: gen/go
+    opt: [lang=go, paths=source_relative]
+  - local: [go, run, ./cmd/protogen-wasm]
+    out: client/ts/gen
+    opt: lang=ts
+  - local: [go, run, ./cmd/protogen-wasm]
+    out: client/dart/lib/gen
+    opt: lang=dart
+  - local: [go, run, ./cmd/protogen-wasm]
+    out: client/kotlin/gen/kotlin
+    opt: lang=kotlin
+  - local: [go, run, ./cmd/protogen-wasm]
+    out: client/swift/Sources/WasmRpcGen
+    opt: lang=swift
