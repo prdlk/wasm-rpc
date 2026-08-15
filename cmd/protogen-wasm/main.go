@@ -21,7 +21,7 @@ import (
 	"google.golang.org/protobuf/compiler/protogen"
 	"google.golang.org/protobuf/types/pluginpb"
 
-	"github.com/hyperauth/wasm-rpc/internal/codegen"
+	"github.com/prdlk/wasm-rpc/internal/codegen"
 )
 
 func main() {
