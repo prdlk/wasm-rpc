@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	echov1 "github.com/hyperauth/wasm-rpc/gen/go/echo/v1"
-	"github.com/hyperauth/wasm-rpc/server"
+	echov1 "github.com/prdlk/wasm-rpc/gen/go/echo/v1"
+	"github.com/prdlk/wasm-rpc/server"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -30,7 +30,7 @@ func newTestRouter(t *testing.T) *server.Router {
 
 func TestRoundTrip(t *testing.T) {
 	r := newTestRouter(t)
-	in, _ := proto.Marshal(&echov1.EchoRequest{Message: "hyperauth"})
+	in, _ := proto.Marshal(&echov1.EchoRequest{Message: "prdlk"})
 
 	out, rpcErr := r.Dispatch(context.Background(), "echo.v1.EchoService/Echo", in)
 	if rpcErr != nil {
@@ -40,7 +40,7 @@ func TestRoundTrip(t *testing.T) {
 	if err := proto.Unmarshal(out, &resp); err != nil {
 		t.Fatal(err)
 	}
-	if resp.GetMessage() != "hyperauth" {
+	if resp.GetMessage() != "prdlk" {
 		t.Fatalf("got %q", resp.GetMessage())
 	}
 }
