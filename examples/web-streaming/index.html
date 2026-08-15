@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>wasm-rpc · web-streaming</title>
+    <!-- Go's JS glue must load before the app: it defines globalThis.Go,
+         which loadWasmRpc() uses to instantiate /server.wasm. -->
+    <script src="/wasm_exec.js"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
