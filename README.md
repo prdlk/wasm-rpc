@@ -198,4 +198,4 @@ including BSR remote plugins. Dart/Kotlin/Swift runtimes and generated
 clients are descriptor-derived but not compiled in this environment —
 wire `dart analyze`, Gradle, and `swift build` into your CI.
 
-Module path is `github.com/hyperauth/wasm-rpc` — sed to taste.
+Module path is `github.com/prdlk/wasm-rpc` — sed to taste.
