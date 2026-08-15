@@ -1,4 +1,4 @@
-module github.com/hyperauth/wasm-rpc
+module github.com/prdlk/wasm-rpc
 
 go 1.24
 
