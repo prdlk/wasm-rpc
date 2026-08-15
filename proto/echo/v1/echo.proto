@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package echo.v1;
 
-option go_package = "github.com/hyperauth/wasm-rpc/gen/go/echo/v1;echov1";
+option go_package = "github.com/prdlk/wasm-rpc/gen/go/echo/v1;echov1";
 
 // EchoService is a generic service used to validate the full
 // client -> Wasm -> Go -> Wasm -> client pipeline.

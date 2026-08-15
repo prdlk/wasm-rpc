@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package ticker.v1;
 
-option go_package = "github.com/hyperauth/wasm-rpc/gen/go/ticker/v1;tickerv1";
+option go_package = "github.com/prdlk/wasm-rpc/gen/go/ticker/v1;tickerv1";
 
 // TickerService demonstrates server-streaming over wasm-rpc: one
 // request in, a paced sequence of responses out, cancellable from the
