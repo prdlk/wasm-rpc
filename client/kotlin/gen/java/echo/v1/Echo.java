@@ -2404,9 +2404,9 @@ public final class Echo extends com.google.protobuf.GeneratedFile {
       "\nunixMillis2\200\001\n\013EchoService\0223\n\004Echo\022\024.ec" +
       "ho.v1.EchoRequest\032\025.echo.v1.EchoResponse" +
       "\022<\n\007Reverse\022\027.echo.v1.ReverseRequest\032\030.e" +
-      "cho.v1.ReverseResponseB5Z3github.com/hyp" +
-      "erauth/wasm-rpc/gen/go/echo/v1;echov1b\006p" +
-      "roto3"
+      "cho.v1.ReverseResponseB1Z/github.com/prd" +
+      "lk/wasm-rpc/gen/go/echo/v1;echov1b\006proto" +
+      "3"
     };
     descriptor = com.google.protobuf.Descriptors.FileDescriptor
       .internalBuildGeneratedFileFrom(descriptorData,

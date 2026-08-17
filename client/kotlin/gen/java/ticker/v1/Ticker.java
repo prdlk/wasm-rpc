@@ -1419,9 +1419,9 @@ public final class Ticker extends com.google.protobuf.GeneratedFile {
       "ic\030\001 \001(\tR\005topic\022\020\n\003seq\030\002 \001(\rR\003seq\022\037\n\013uni" +
       "x_millis\030\003 \001(\003R\nunixMillis2Y\n\rTickerServ" +
       "ice\022H\n\tSubscribe\022\033.ticker.v1.SubscribeRe" +
-      "quest\032\034.ticker.v1.SubscribeResponse0\001B9Z" +
-      "7github.com/prdlk/wasm-rpc/gen/go/ti" +
-      "cker/v1;tickerv1b\006proto3"
+      "quest\032\034.ticker.v1.SubscribeResponse0\001B5Z" +
+      "3github.com/prdlk/wasm-rpc/gen/go/ticker" +
+      "/v1;tickerv1b\006proto3"
     };
     descriptor = com.google.protobuf.Descriptors.FileDescriptor
       .internalBuildGeneratedFileFrom(descriptorData,
