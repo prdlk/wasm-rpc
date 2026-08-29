@@ -26,7 +26,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Blume derives "Last updated on ..." from commit dates when
           # `lastModified` is enabled; a shallow clone has none.
@@ -37,7 +37,7 @@ jobs:
           bun-version: "1.4.0"
 
       # Blume requires Node 22.12+; the `blume` bin runs under node.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -50,9 +50,11 @@ jobs:
       - name: Validate links
         run: bunx blume validate
 
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v3
+      # No `actions/configure-pages` step: `deployment.site` and
+      # `deployment.base` are pinned in blume.config.ts, so there is
+      # nothing to detect — and skipping it keeps this job on
+      # `contents: read` alone.
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: dist
 
@@ -67,4 +69,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
