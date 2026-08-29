@@ -1,0 +1,199 @@
+---
+title: Errors
+description: Four codes, one triple on the wire, and how each language re-materializes it — including the two places the source comments are wrong.
+sidebar:
+  label: Errors
+  order: 3
+---
+
+## The four codes
+
+```go title="server/errors.go:7-14"
+type Code string
+
+const (
+	CodeInvalidArgument Code = "invalid_argument"
+	CodeUnimplemented   Code = "unimplemented"
+	CodeInternal        Code = "internal"
+	CodeUnknown         Code = "unknown"
+)
+```
+
+There are exactly four. Every language treats `code` as an open `string` rather
+than a closed enum, so an unrecognized value degrades to a comparison miss
+instead of a decode failure.
+
+## The error type
+
+```go title="server/errors.go:20-32"
+type Error struct {
+	Code    Code
+	Method  string
+	Message string
+	detail  string // unexported
+}
+
+func (e *Error) Error() string // -> "<code>: <message>"
+```
+
+`detail` carries `debug.Stack()` for recovered panics. It is logged to
+`console.error` by both browser bridges and is **never** part of any wire
+payload — a stack trace must not leak to application code.
+
+## `Errorf` is not a format function
+
+```go title="server/errors.go:36-38"
+func Errorf(code Code, msg string) *Error
+```
+
+:::danger[Misleading name]
+Despite the `-f` suffix this takes a **plain string**. It is not variadic and
+accepts no format verbs. Pre-format with `fmt.Sprintf`:
+
+```go
+return nil, server.Errorf(server.CodeInvalidArgument,
+	fmt.Sprintf("repeat must be <= 1000, got %d", req.GetRepeat()))
+```
+:::
+
+`Errorf` leaves `Method` empty. The unexported `asError`
+(`server/errors.go:40-49`) backfills it from the dispatched method, and uses
+`errors.As` — so a `*Error` wrapped anywhere in the chain keeps its code. Any
+other error becomes `unknown`.
+
+## What crosses the boundary
+
+Browser
+: A real JS `Error` instance whose `message` is `e.Message`, with two extra own
+  properties `.code` and `.method` (`server/bridge.go:118-122`).
+
+wasip1
+: A frame with status byte `2` whose payload is
+  `code "\n" method "\n" message` (`server/wasip1.go:102`).
+
+:::warning[Stale source comment]
+`server/errors.go:19` describes the browser rejection as a *"plain JS object
+`{code, message, method}`"*. It is not — it is an `Error` instance with extra
+own properties. This matters: `e instanceof Error` is true, and
+`JSON.stringify(e)` will not show `message`.
+:::
+
+Split the wasip1 error payload with a **limit of 3**. The message may itself
+contain newlines:
+
+```go title="examples/e2e/wasip1host/main.go:76-77"
+parts := strings.SplitN(string(payload), "\n", 3)
+// parts[0] = code, parts[1] = method, parts[2] = message
+```
+
+## Per-language error type
+
+The `{code, method, message}` triple is the cross-language invariant. Each
+runtime re-materializes it locally.
+
+| Language   | Type                 | Shape                                                        | Source                              |
+| ---------- | -------------------- | ------------------------------------------------------------ | ----------------------------------- |
+| Go         | `*wasmrpcclient.Error` | `Code string`, `Method string`, `Message string`           | `client/go/transport.go:19-23`      |
+| TypeScript | `WasmRpcError`       | `extends Error`; `readonly code`, `readonly method?`         | `client/ts/src/client.ts:26-35`     |
+| Dart       | `WasmRpcException`   | `implements Exception`; positional `(code, method, message)`  | `client/dart/lib/src/transport.dart:9-18` |
+| Kotlin     | `WasmRpcException`   | `val code`, `val method?`; **`message` is not a property**    | `client/kotlin/.../Transport.kt:21-25` |
+| Swift      | `WasmRpcError`       | `struct`; `public let code/method/message`                    | `client/swift/Sources/WasmRpc/Transport.swift:17-26` |
+
+Note the Go client widens `server.Code` to a plain `string`
+(`client/go/transport.go:36`), so compare against the literal
+`"invalid_argument"`, not the `server.Code` constant.
+
+:::warning[Kotlin deviates]
+```kotlin
+class WasmRpcException(
+    val code: String,
+    val method: String?,
+    message: String,
+) : Exception("$code: $message")
+```
+`message` is a **constructor parameter, not a property**. The inherited
+`Throwable.message` therefore reads `"invalid_argument: repeat must be <= 1000"`
+— the code is prefixed in, and the bare message cannot be recovered. Dart and
+Swift keep `message` as a separate field. Any cross-language error-formatting
+code must account for this.
+:::
+
+## Handling errors
+
+<Tabs>
+  <Tab title="TypeScript">
+
+```ts
+try {
+  await client.echo({ message: "x", repeat: 5000 });
+} catch (e) {
+  if (e instanceof WasmRpcError) {
+    console.error(`${e.code}: ${e.message}`, e.method);
+  }
+}
+```
+
+Streaming errors **throw out of the `for await` loop**
+(`client/ts/src/client.ts:232`) — there is no separate error callback at the
+generated-client layer.
+
+  </Tab>
+  <Tab title="Go">
+
+```go
+var rpcErr *wasmrpcclient.Error
+if errors.As(err, &rpcErr) && rpcErr.Code == "invalid_argument" {
+	// ...
+}
+```
+
+Pointer receiver, so `errors.As` needs a `*wasmrpcclient.Error` target. Pinned
+by `examples/server-basic/service_test.go:38`.
+
+  </Tab>
+  <Tab title="Swift">
+
+```swift
+do {
+    _ = try await client.echo(req)
+} catch let e as WasmRpcError {
+    print("\(e.code): \(e.message)")
+}
+```
+
+`WasmRpcError` does **not** conform to `LocalizedError`, so
+`error.localizedDescription` yields the generic Foundation fallback rather than
+`message`.
+
+  </Tab>
+</Tabs>
+
+## Unary calls are not cancellable in the browser
+
+`server/bridge.go` passes `context.Background()` to `Dispatch`. There is no
+per-call cancellation on the browser unary path — the mounted global exposes no
+way to abort an `invoke`. Only streams have `cancel(id)`.
+
+The wasip1 path is the same for unary: `wasmrpc_invoke` is a blocking,
+non-cancellable call. Model long-running work as a server stream if you need to
+abort it.
+
+## Robustness at the bridge
+
+Both bridges validate before touching the router, and every rejection is a typed
+`*Error` rather than a trap:
+
+| Input                                     | Code               | Message                                                 |
+| ----------------------------------------- | ------------------ | ------------------------------------------------------- |
+| `invoke` with wrong arity                 | `invalid_argument` | `invoke(method, payload) requires exactly 2 arguments`  |
+| non-string method                         | `invalid_argument` | `method must be a string`                               |
+| non-`Uint8Array` payload                  | `invalid_argument` | `payload must be a Uint8Array`                          |
+| `listen` with wrong arity                 | `invalid_argument` | `listen(method, payload, handlers) requires exactly 3 arguments` |
+| `handlers.onMessage` not a function       | `invalid_argument` | `handlers.onMessage must be a function`                 |
+| short copy across the boundary            | `internal`         | `short copy across Wasm boundary`                       |
+| method buffer not from `wasmrpc_alloc`    | `invalid_argument` | `method buffer not allocated via wasmrpc_alloc`         |
+| no router attached (wasip1)               | `internal`         | `no router attached: call server.Attach in init()`      |
+
+`examples/e2e/e2e.mjs:72-75` asserts this directly by passing the string
+`"not bytes"` where a `Uint8Array` belongs and requiring an `invalid_argument`
+rejection rather than a crash.

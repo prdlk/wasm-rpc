@@ -11,3 +11,4 @@ examples/web-echo/public/wasm_exec.js
 examples/web-streaming/public/server.wasm
 examples/web-streaming/public/wasm_exec.js
 *.tsbuildinfo
+.blume/

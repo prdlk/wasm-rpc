@@ -1,0 +1,200 @@
+---
+title: Server
+description: The platform-neutral core — registration, dispatch, the generic Register helpers, and the buffer pooling that keeps the Wasm boundary to one copy per direction.
+sidebar:
+  label: Router
+  order: 1
+---
+
+Import path `github.com/prdlk/wasm-rpc/server`, package clause `server`.
+
+:::note
+The doc comment at `server/router.go:1` says *"Package wasmrpc"* and the example
+at `server/router.go:100` writes `wasmrpc.Register(...)`. Both are stale. The
+package is `server`; correct usage is `server.Register(...)`, which is what
+`server/router_test.go:16` actually does.
+:::
+
+## Build-tag matrix
+
+The core is deliberately free of build tags so it compiles and unit-tests on a
+native `GOOS`.
+
+| File                                  | Build tag                | Available on                          |
+| ------------------------------------- | ------------------------ | ------------------------------------- |
+| `router.go`, `stream.go`, `errors.go` | none                     | every `GOOS`, including `go test`     |
+| `bridge.go`, `bridge_stream.go`       | `//go:build js && wasm`  | browser only                          |
+| `wasip1.go`                           | `//go:build wasip1`      | WASI hosts, TinyGo `-target=wasip1`   |
+
+Consequently `Router.Mount` exists **only** under `js && wasm`, and
+`server.Attach` exists **only** under `wasip1`.
+
+## API surface
+
+```go
+type Handler       func(ctx context.Context, payload []byte) ([]byte, error)              // router.go:20
+type SendFunc      func(msg []byte) error                                                 // stream.go:20
+type StreamHandler func(ctx context.Context, payload []byte, send SendFunc) error         // stream.go:23
+
+func NewRouter() *Router                                            // router.go:31
+func (r *Router) RegisterRaw(method string, h Handler)              // router.go:40
+func (r *Router) RegisterRawStream(method string, h StreamHandler)  // stream.go:27
+func (r *Router) Methods() []string                                 // router.go:53
+func (r *Router) Dispatch(ctx context.Context, method string, payload []byte) ([]byte, *Error)             // router.go:70
+func (r *Router) DispatchStream(ctx context.Context, method string, payload []byte, send SendFunc) *Error  // stream.go:43
+func RecycleResponse(b []byte)                                      // router.go:169
+```
+
+## The generic helpers
+
+You will almost never call `RegisterRaw` directly — the generated
+`RegisterXServiceServer` functions call these instead. They own unmarshalling
+the request and marshalling the response.
+
+```go title="server/router.go:108-115"
+func Register[
+	Req any, Resp any,
+	PReq  interface{ proto.Message; *Req },
+	PResp interface{ proto.Message; *Resp },
+](r *Router, method string, h func(context.Context, PReq) (PResp, error))
+```
+
+```go title="server/stream.go:105-108"
+func RegisterServerStream[
+	Req any, Resp proto.Message,
+	PReq interface{ proto.Message; *Req },
+](r *Router, method string, h func(context.Context, PReq, *ServerStream[Resp]) error)
+```
+
+:::warning[Asymmetric type parameters]
+Note the difference: `Register` constrains `Resp` with the value-plus-pointer
+pair, while `RegisterServerStream` constrains `Resp` directly with
+`proto.Message` — so `Resp` infers as the **pointer** type, e.g.
+`*echov1.EchoResponse`. That is why a streaming handler's third parameter reads
+`*server.ServerStream[*tickerv1.SubscribeResponse]`.
+:::
+
+See [Server streaming](/server/streaming) for `ServerStream`, cancellation
+semantics, and per-host backpressure.
+
+## Registration panics at startup
+
+Registration conflicts are programmer errors, not runtime conditions, so they
+panic during setup rather than returning an error.
+
+| Condition                                    | Panic message                                    | Source        |
+| -------------------------------------------- | ------------------------------------------------ | ------------- |
+| duplicate unary name                         | `wasmrpc: duplicate registration for %q`         | router.go:44  |
+| unary name already registered as a stream    | `wasmrpc: %q already registered as stream`       | router.go:47  |
+| duplicate stream name                        | `wasmrpc: duplicate stream registration for %q`  | stream.go:31  |
+| stream name already registered as unary      | `wasmrpc: %q already registered as unary`        | stream.go:34  |
+
+## Method names
+
+By convention `pkg.v1.Service/Method`, baked in by the generator. The router
+treats them as **opaque map keys** — it never parses or validates them.
+`server/router_test.go:21` registers a bare `test/Panic` and it dispatches fine.
+
+`Methods()` returns unary names followed by stream names **in Go map order**.
+It is unsorted; do not depend on the ordering. The Node harness sorts before
+comparing (`examples/e2e/e2e.mjs:44-48`).
+
+## Concurrency
+
+One `sync.RWMutex` (`server/router.go:26`). Registration takes the write lock.
+`Dispatch` and `DispatchStream` take the read lock **only** for the map lookup
+and release it before invoking the handler, so handlers run fully concurrently
+and a slow handler never blocks dispatch of another method.
+
+## Dispatch outcomes
+
+Every failure mode produces a `*Error` with one of four codes. Nothing panics
+out of `Dispatch`.
+
+| Situation                       | Code               | Message                                           | Source                       |
+| ------------------------------- | ------------------ | ------------------------------------------------- | ---------------------------- |
+| unary handler panic             | `internal`         | `panic in handler: <v>`                            | router.go:74-77              |
+| stream handler panic            | `internal`         | `panic in stream handler: <v>`                     | stream.go:47-50              |
+| `invoke` on a stream method     | `invalid_argument` | `server-streaming method: use listen, not invoke` | router.go:88                 |
+| `listen` on a unary method      | `invalid_argument` | `unary method: use invoke, not listen`            | stream.go:61                 |
+| unknown method                  | `unimplemented`    | `method not registered`                            | router.go:90, stream.go:63   |
+| bad request bytes               | `invalid_argument` | `unmarshal request: …`                             | router.go:118, stream.go:112 |
+| response marshal failure        | `internal`         | `marshal response: …`                              | router.go:126                |
+| handler-returned error          | via `asError`      | passthrough, or `unknown`                          | router.go:95                 |
+
+Recovered panics also carry an unexported `detail` field holding
+`debug.Stack()`. It is logged to `console.error` by the browser bridges and is
+**never** part of any wire payload. See [Errors](/server/errors).
+
+## The vtprotobuf fast path
+
+Exactly two interfaces are asserted:
+
+```go title="server/router.go:140-141"
+type vtMarshaler   interface{ MarshalVT() ([]byte, error) }
+type vtUnmarshaler interface{ UnmarshalVT([]byte) error }
+```
+
+`marshalMessage` tries `MarshalVT` first; otherwise it pulls a pooled buffer and
+falls back to `proto.MarshalOptions{}.MarshalAppend(buf[:0], m)`
+(`server/router.go:147-148`), returning the buffer to the pool on error.
+`unmarshalMessage` tries `UnmarshalVT`, else `proto.Unmarshal`.
+
+There is **no** `SizeVT` and **no** `MarshalToSizedBufferVT` assertion anywhere
+in `server/`. `MarshalAppend` is the reflection fallback, not an asserted
+interface.
+
+`buf.gen.yaml:8-10` generates `features=marshal+unmarshal+size` for every
+message, so the fast path is always available in this repository.
+
+## Buffer pooling
+
+Two independent `sync.Pool`s, both seeded at 4 KiB:
+
+- `marshalPool` — responses and stream frames (`server/router.go:163-165`)
+- `reqPool` — browser-inbound requests (`server/bridge.go:30-32`)
+
+`RecycleResponse(b)` returns a buffer to `marshalPool`, no-oping when
+`cap(b) == 0`.
+
+:::danger[Borrowed payloads]
+The `payload` slice handed to a `Handler` is valid **only for the duration of
+the call** (`server/router.go:17-19`). Typed handlers registered through
+`Register` are always safe because `proto.Unmarshal`/`UnmarshalVT` copy field
+data. A raw handler that retains the slice will observe corrupted bytes once the
+buffer is reused.
+:::
+
+One known wart: on the `MarshalVT` path the returned slice never came from
+`marshalPool`, yet `RecycleResponse` still `Put`s it. Harmless — it just seeds
+the pool with vt-allocated buffers.
+
+## What the tests pin
+
+`server/router_test.go` is an external test package (`package server_test`), so
+it exercises only the exported surface.
+
+<Steps>
+  <Step title="TestRoundTrip">
+    A marshalled request through `Dispatch` round-trips to a decodable response.
+  </Step>
+  <Step title="TestPanicRecovery">
+    A panicking handler yields `CodeInternal` with the panic value preserved in
+    `Message`.
+  </Step>
+  <Step title="TestTypedErrorPassthrough">
+    An `Errorf` code survives `asError` unchanged.
+  </Step>
+  <Step title="TestUnimplemented">
+    An unregistered method yields `CodeUnimplemented`.
+  </Step>
+  <Step title="TestMalformedPayload">
+    `0xff 0xff 0xff` yields `CodeInvalidArgument`.
+  </Step>
+</Steps>
+
+Not covered by this file: all streaming, the registration panics, the
+unary/stream cross-dispatch errors, `Methods()`, pooling, and both bridges.
+Streaming is covered instead by
+`examples/server-streaming/service_test.go` (four loopback tests) and by the two
+E2E harnesses.

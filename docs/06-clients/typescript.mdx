@@ -1,0 +1,250 @@
+---
+title: TypeScript
+description: The most complete runtime — loadWasmRpc, WasmRpcTransport, the unary and serverStream factories, and the async-iterable stream with cancel().
+sidebar:
+  label: TypeScript
+  order: 2
+---
+
+Package `@prdlk/wasm-rpc-client`, version `0.1.0`, ESM only.
+
+```ts
+import { loadWasmRpc, WasmRpcError, WasmRpcTransport } from "@prdlk/wasm-rpc-client";
+import { EchoServiceClient } from "@prdlk/wasm-rpc-client/gen/echo/v1/echo_wasmrpc.pb.js";
+```
+
+The `./gen/*` export is a wildcard mapping straight onto `dist/gen/*`, so the
+`.js` suffix is part of the specifier.
+
+## Package facts
+
+| Field            | Value                                                       |
+| ---------------- | ----------------------------------------------------------- |
+| name             | `@prdlk/wasm-rpc-client`                                    |
+| version          | `0.1.0`                                                     |
+| type             | `module`                                                    |
+| dependencies     | `@bufbuild/protobuf ^2.2.3`                                 |
+| devDependencies  | `@bufbuild/protoc-gen-es ^2.2.3`, `typescript ^5.7.3`       |
+| target / module  | `ES2022` / `NodeNext`, `lib: ["ES2022", "DOM"]`, `strict`   |
+
+:::note[No engines field]
+`client/ts/package.json` declares **no** `engines` constraint. The emitted code
+targets ES2022 with the DOM lib, so `WebAssembly.instantiateStreaming` and
+`fetch` are assumed present; the Node harness supplies them itself. Do not
+document a minimum Node version for the package — the manifest states none.
+(The repository's *build* prerequisites are separate: `Makefile:3` asks for
+Node >= 20.)
+:::
+
+Both `src/` and `gen/` are compiled, so `dist/` mirrors them as `dist/src/**` and
+`dist/gen/**` — which is exactly what the exports map points at.
+
+## `loadWasmRpc`
+
+```ts
+function loadWasmRpc(wasmUrl: string): Promise<WasmRpcTransport>
+```
+
+The browser bootstrap. It reads `globalThis.Go`, parks a readiness resolver on
+`globalThis.__wasmRPCReady`, instantiates via `instantiateStreaming`, calls
+`go.run(instance)` **without awaiting** it, waits for the Go side to invoke the
+resolver, and returns a transport wrapping `globalThis.wasmRPC`.
+
+Failure modes throw plain `Error`s, not `WasmRpcError`s:
+
+| Cause                                   | Message                                              |
+| --------------------------------------- | ---------------------------------------------------- |
+| `wasm_exec.js` missing or deferred      | `wasm_exec.js not loaded: global Go class is missing`|
+| entrypoint never called `r.Mount(...)`  | `Go module ran but did not mount globalThis.wasmRPC` |
+
+See [Browser host › Bootstrapping](/hosts/browser#bootstrapping) for the full
+handshake.
+
+## `WasmRpcTransport`
+
+```ts
+class WasmRpcTransport {
+  constructor(host: WasmRpcHost);
+
+  methods(): string[];
+  invoke(method: string, payload: Uint8Array): Promise<Uint8Array>;
+  listenRaw(method: string, payload: Uint8Array): WasmRpcStream<Uint8Array>;
+
+  call<Req extends DescMessage, Resp extends DescMessage>(
+    method: string,
+    reqSchema: Req,
+    respSchema: Resp,
+    init: MessageInitShape<Req>,
+  ): Promise<MessageShape<Resp>>;
+}
+```
+
+You may construct it directly when you bootstrap the module yourself — that is
+the documented escape hatch for non-browser hosts:
+
+```js
+const transport = new WasmRpcTransport(globalThis.wasmRPC);
+```
+
+`invoke` funnels every host rejection through an internal coercer, so it **always**
+rejects with a `WasmRpcError` — even when the host throws something that is not
+an `Error`.
+
+`methods()` returns the router's registered names, unsorted. Handy for confirming
+a module mounted what you expected; `examples/web-echo` renders it in the UI.
+
+## The two factories
+
+Generated clients are built entirely from these.
+
+```ts
+function unary<Req extends DescMessage, Resp extends DescMessage>(
+  transport: WasmRpcTransport,
+  method: string,
+  reqSchema: Req,
+  respSchema: Resp,
+): (init: MessageInitShape<Req>) => Promise<MessageShape<Resp>>;
+
+function serverStream<Req extends DescMessage, Resp extends DescMessage>(
+  transport: WasmRpcTransport,
+  method: string,
+  reqSchema: Req,
+  respSchema: Resp,
+): (init: MessageInitShape<Req>) => WasmRpcStream<MessageShape<Resp>>;
+```
+
+Each returns a **closure**, which is why generated clients expose RPCs as
+`readonly` fields rather than methods — the field's type is inferred from the
+factory.
+
+## The stream type
+
+```ts
+interface WasmRpcStream<T> extends AsyncIterable<T> {
+  cancel(): void;
+}
+```
+
+`serverStream`'s closure returns this **synchronously**, not as a promise:
+
+```ts
+const stream = client.subscribe({ topic: "tick", count: 50 });
+for await (const tick of stream) {
+  if (tick.seq === 3) stream.cancel();
+}
+```
+
+Behavior worth knowing:
+
+Errors throw out of the loop
+: The iterator throws a `WasmRpcError` rather than surfacing a separate callback.
+  Wrap the `for await` in `try`/`catch`.
+
+Normal end returns
+: The iterator simply returns on `onEnd`, so the loop exits cleanly — including
+  after a `cancel()`.
+
+Cancellation is asynchronous
+: `cancel()` calls the host's `cancel(id)`, which cancels the handler context. The
+  pending `await` resolves only when the host subsequently pushes `onEnd`.
+
+The queue is unbounded
+: Frames accumulate in memory if the consumer is slower than the producer. The
+  runtime declines to implement backpressure here on purpose and defers it to the
+  protocol — bound the stream with a request field, as `ticker.v1` does with
+  `count`.
+
+Missing host capability fails fast
+: If the module was built without streaming support, the host's `listen`/`cancel`
+  keys are absent and `listenRaw` throws an `unimplemented` `WasmRpcError`
+  **synchronously**: `wasm host does not export listen/cancel (rebuild the module)`.
+
+## Errors
+
+```ts
+interface WasmRpcErrorShape {
+  code: "invalid_argument" | "unimplemented" | "internal" | "unknown" | string;
+  method?: string;
+  message: string;
+}
+
+class WasmRpcError extends Error implements WasmRpcErrorShape {
+  readonly code: string;
+  readonly method?: string;
+}
+```
+
+The union is widened with `| string` deliberately: it documents the four
+canonical codes without making an unrecognized value a type error.
+
+```ts
+try {
+  await client.echo({ message: "x", repeat: 5000 });
+} catch (e) {
+  if (e instanceof WasmRpcError) console.error(`${e.code}: ${e.message}`);
+}
+```
+
+## Generated client shape
+
+```ts title="client/ts/gen/ticker/v1/ticker_wasmrpc.pb.ts"
+export class TickerServiceClient {
+  readonly subscribe;
+
+  constructor(transport: WasmRpcTransport) {
+    this.subscribe = serverStream(
+      transport,
+      "ticker.v1.TickerService/Subscribe",
+      SubscribeRequestSchema,
+      SubscribeResponseSchema,
+    );
+  }
+}
+```
+
+The `*Schema` constants come from `protoc-gen-es` output (`*_pb.ts`) and are the
+`DescMessage` values the factories consume.
+
+## A React example
+
+`examples/web-streaming/src/App.tsx`, condensed:
+
+```tsx
+const [client, setClient] = useState<TickerServiceClient | null>(null);
+const streamRef = useRef<WasmRpcStream<Tick> | null>(null);
+
+useEffect(() => {
+  loadWasmRpc("/server.wasm").then((t) => setClient(new TickerServiceClient(t)));
+}, []);
+
+async function start() {
+  const stream = client!.subscribe({ topic, count, intervalMs });
+  streamRef.current = stream;
+  try {
+    for await (const tick of stream) setTicks((prev) => [...prev, tick]);
+    setStatus((s) => (s === "streaming" ? "done" : s)); // preserve "cancelled"
+  } finally {
+    streamRef.current = null;
+  }
+}
+
+function cancel() {
+  streamRef.current?.cancel();
+  setStatus("cancelled");
+}
+```
+
+The `setStatus` guard matters: after `cancel()` the loop exits normally, so an
+unconditional `setStatus("done")` would overwrite the `cancelled` state.
+
+## Non-browser hosts
+
+Instantiate yourself and wrap the global. `examples/e2e/e2e.mjs` imports the
+compiled output directly rather than by package specifier, because it is testing
+the build:
+
+```js
+const { WasmRpcTransport, WasmRpcError } = await import(
+  join(root, "client/ts/dist/src/client.js")
+);
+```

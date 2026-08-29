@@ -1,0 +1,198 @@
+---
+title: Go
+description: Transport and StreamTransport interfaces plus the in-process Loopback that lets you test a service without a Wasm boundary.
+sidebar:
+  label: Go
+  order: 3
+---
+
+Import path `github.com/prdlk/wasm-rpc/client/go`, package clause
+`wasmrpcclient`. The whole runtime is one file, `client/go/transport.go`.
+
+```go
+import (
+	wasmrpcclient "github.com/prdlk/wasm-rpc/client/go"
+	"github.com/prdlk/wasm-rpc/server"
+)
+```
+
+## Interfaces
+
+```go title="client/go/transport.go:13-15, :48-55"
+type Transport interface {
+	Invoke(ctx context.Context, method string, payload []byte) ([]byte, error)
+}
+
+type StreamTransport interface {
+	Transport
+	Listen(
+		ctx context.Context,
+		method string,
+		payload []byte,
+		onMsg func([]byte) error,
+	) error
+}
+```
+
+`Listen`'s documented contract:
+
+- Blocks until the stream ends, invoking `onMsg` once per frame.
+- Frame bytes are valid **only during the callback**.
+- A non-nil `onMsg` error cancels the stream and is returned.
+- Context cancellation returns `ctx.Err()`.
+
+## `Loopback`
+
+```go title="client/go/transport.go:29"
+func Loopback(r *server.Router) StreamTransport
+```
+
+An in-process transport that dispatches straight into a `Router` — no Wasm, no
+serialization boundary, no build tags. It returns the streaming superset, so it
+satisfies both interfaces.
+
+This is the primary way to unit-test a service. From
+`examples/server-basic/service_test.go`:
+
+```go
+func TestGeneratedClientLoopback(t *testing.T) {
+	r := server.NewRouter()
+	echov1.RegisterEchoServiceServer(r, basic.New())
+	c := echov1.NewEchoServiceClient(wasmrpcclient.Loopback(r))
+
+	res, err := c.Echo(context.Background(), &echov1.EchoRequest{
+		Message: "hi", Repeat: 2,
+	})
+	// res.GetMessage() == "hihi"
+
+	_, err = c.Echo(context.Background(), &echov1.EchoRequest{Repeat: 9999})
+	var rpcErr *wasmrpcclient.Error
+	if !errors.As(err, &rpcErr) || rpcErr.Code != "invalid_argument" {
+		t.Fatalf("want invalid_argument, got %v", err)
+	}
+}
+```
+
+:::note[Loopback reproduces the pooling discipline]
+`Invoke` deep-copies the response and then calls `server.RecycleResponse`
+(`client/go/transport.go:41-43`). That is deliberate: an in-process test exhibits
+the same buffer-reuse behavior as the real pooled bridge, so a handler that
+illegally retains bytes fails in tests rather than only in production.
+
+`Listen` passes frames through **un-copied**, matching the real bridge exactly.
+:::
+
+## Errors
+
+```go title="client/go/transport.go:19-25"
+type Error struct {
+	Code    string
+	Method  string
+	Message string
+}
+
+func (e *Error) Error() string // -> "<code>: <message>"
+```
+
+:::warning[`Code` is a plain `string`]
+The client widens `server.Code` to `string`
+(`string(rpcErr.Code)` at `client/go/transport.go:36`). Compare against the
+literal `"invalid_argument"`, not the `server.CodeInvalidArgument` constant.
+:::
+
+The receiver is a pointer, so `errors.As` needs a `*wasmrpcclient.Error` target.
+
+`Listen`'s error precedence (`client/go/transport.go:70-76`):
+
+<Steps>
+  <Step title="Callback error">
+    A non-nil `onMsg` return wins and is propagated verbatim.
+  </Step>
+  <Step title="Router error">
+    Otherwise a `*server.Error` is wrapped into a `*wasmrpcclient.Error`.
+  </Step>
+  <Step title="Context error">
+    Otherwise `ctx.Err()`, if non-nil.
+  </Step>
+  <Step title="nil">
+    Otherwise the stream ended normally.
+  </Step>
+</Steps>
+
+## Generated client shape
+
+Unary-only services take the narrow transport:
+
+```go title="gen/go/echo/v1/echo_wasmrpc.pb.go"
+type EchoServiceClient struct { t _go.Transport }
+
+func NewEchoServiceClient(t _go.Transport) *EchoServiceClient
+
+func (c *EchoServiceClient) Echo(ctx context.Context, req *EchoRequest) (*EchoResponse, error)
+func (c *EchoServiceClient) Reverse(ctx context.Context, req *ReverseRequest) (*ReverseResponse, error)
+```
+
+Any service with a server-streaming method widens to `StreamTransport`, and the
+streaming method is **callback-style**, not a channel:
+
+```go title="gen/go/ticker/v1/ticker_wasmrpc.pb.go"
+type TickerServiceClient struct { t _go.StreamTransport }
+
+func NewTickerServiceClient(t _go.StreamTransport) *TickerServiceClient
+
+// Subscribe server-streams; fn is invoked once per message and a
+// non-nil return cancels the stream.
+func (c *TickerServiceClient) Subscribe(
+	ctx context.Context,
+	req *SubscribeRequest,
+	fn func(*SubscribeResponse) error,
+) error
+```
+
+## Cancelling a stream
+
+Return a non-nil error from the callback. `examples/server-streaming/service_test.go`
+pins this:
+
+```go
+sentinel := context.Canceled
+var seen int
+err := c.Subscribe(ctx, &tickerv1.SubscribeRequest{Count: 10},
+	func(m *tickerv1.SubscribeResponse) error {
+		seen++
+		if seen == 2 {
+			return sentinel
+		}
+		return nil
+	})
+// errors.Is(err, sentinel) && seen == 2
+```
+
+Cancelling the context works too, and yields `ctx.Err()`.
+
+## Writing a custom transport
+
+Implement the two interfaces over whatever moves your bytes — a wazero host, a
+CGO bridge, an IPC socket. The generated clients depend on nothing else.
+
+```go
+type myTransport struct{ /* ... */ }
+
+func (t *myTransport) Invoke(ctx context.Context, method string, payload []byte) ([]byte, error) {
+	// move bytes; on a wire error return &wasmrpcclient.Error{Code: ..., Method: method, Message: ...}
+}
+
+func (t *myTransport) Listen(ctx context.Context, method string, payload []byte, onMsg func([]byte) error) error {
+	// call onMsg per frame; a non-nil return must cancel the underlying stream
+}
+```
+
+Two rules a correct implementation must honor:
+
+1. **Do not retain frames** you hand to `onMsg`, and document that the callee
+   must not either.
+2. **Translate wire errors into `*wasmrpcclient.Error`** so callers can
+   `errors.As` uniformly regardless of transport.
+
+For the wasip1 wire format a custom transport would need to speak, see
+[WASI host](/hosts/wasip1).

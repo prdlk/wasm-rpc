@@ -1,0 +1,190 @@
+---
+title: Quickstart
+description: Generate bindings, build a Wasm module, and call a Go service from TypeScript — then prove it with the Node and wazero harnesses.
+sidebar:
+  icon: rocket
+---
+
+## Prerequisites
+
+Declared in `Makefile:3-8` and `go.mod:3`.
+
+| Tool   | Version           | Needed for                                       |
+| ------ | ----------------- | ------------------------------------------------ |
+| Go     | >= 1.24           | `go:wasmexport` requires 1.24                    |
+| buf    | >= 1.50           | buf v2 workspace config                          |
+| Node   | >= 20             | `protoc-gen-es`, `tsc`, the E2E harness          |
+| TinyGo | >= 0.34, optional | small modules; 0.38 for the sizes quoted in docs |
+
+Dart, Kotlin, and Swift toolchains are **not** required. Their message stubs
+come from buf remote plugins on the BSR (`buf.gen.yaml:14-22`), and vtprotobuf
+runs through the `go.mod` `tool` directive.
+
+## Generate everything
+
+One command produces twelve outputs — message stubs for five languages plus
+wasm-rpc bindings from `cmd/protogen-wasm`.
+
+```sh
+make lint generate   # buf lint, then buf generate
+```
+
+:::note
+`buf.gen.yaml` sets `clean: true`, so every output directory is wiped and
+rewritten each run. `gen/` and `client/ts/gen/` **are** committed to the
+repository, but `make clean` deletes them — after a `make clean` you must
+re-run `buf generate` before `go test ./...` will compile.
+:::
+
+## Write a service
+
+The service package carries **no build tags**, so the same code compiles for
+native tests, the browser, and WASI. This is `examples/server-basic/service.go`:
+
+```go title="examples/server-basic/service.go"
+func (s *Service) Echo(_ context.Context, req *echov1.EchoRequest) (*echov1.EchoResponse, error) {
+	if req.GetRepeat() > 1000 {
+		return nil, server.Errorf(server.CodeInvalidArgument, "repeat must be <= 1000")
+	}
+	msg := req.GetMessage()
+	if req.GetRepeat() > 1 {
+		msg = strings.Repeat(msg, int(req.GetRepeat()))
+	}
+	return &echov1.EchoResponse{Message: msg, UnixMillis: time.Now().UnixMilli()}, nil
+}
+```
+
+## Pick an entrypoint
+
+The service is shared; only the thin entrypoint differs per target. This is the
+**entire** difference between the two hosts.
+
+<Tabs>
+  <Tab title="Browser">
+
+```go title="examples/server-basic/wasm/main.go"
+//go:build js && wasm
+
+func main() {
+	r := server.NewRouter()
+	echov1.RegisterEchoServiceServer(r, basic.New())
+	r.Mount("wasmRPC")
+
+	if ready := js.Global().Get("__wasmRPCReady"); ready.Truthy() {
+		ready.Invoke()
+	}
+	select {} // keep the Go runtime alive
+}
+```
+
+  </Tab>
+  <Tab title="WASI">
+
+```go title="examples/server-basic/wasip1/main.go"
+//go:build wasip1
+
+func init() {
+	r := server.NewRouter()
+	echov1.RegisterEchoServiceServer(r, basic.New())
+	server.Attach(r)
+}
+
+func main() {} // reactors run inits, not main
+```
+
+  </Tab>
+</Tabs>
+
+:::warning[Register from `init()` on WASI]
+A `-buildmode=c-shared` module is a **reactor**. The host starts it by calling
+`_initialize`, which runs package inits and returns — `main` is never invoked.
+`examples/e2e/wasip1host/main.go:93-94` proves this with
+`wazero.NewModuleConfig().WithStartFunctions("_initialize")`. Registration in
+`main()` would never run.
+:::
+
+## Build
+
+```sh
+make wasm             # GOOS=js GOARCH=wasm -> examples/e2e/app.wasm + wasm_exec.js
+make wasip1           # GOOS=wasip1 GOARCH=wasm -buildmode=c-shared
+make wasm-tinygo      # TinyGo browser module
+make wasip1-tinygo    # TinyGo reactor
+make ts               # tsc -> client/ts/dist
+```
+
+## Call it from TypeScript
+
+`wasm_exec.js` must load **before** your bundle — it defines `globalThis.Go`,
+which `loadWasmRpc` requires.
+
+```html title="index.html"
+<script src="/wasm_exec.js"></script>
+<script type="module" src="/src/main.tsx"></script>
+```
+
+```ts title="src/App.tsx"
+import { loadWasmRpc, WasmRpcError } from "@prdlk/wasm-rpc-client";
+import { EchoServiceClient } from "@prdlk/wasm-rpc-client/gen/echo/v1/echo_wasmrpc.pb.js";
+
+const transport = await loadWasmRpc("/server.wasm");
+const client = new EchoServiceClient(transport);
+
+try {
+  const res = await client.echo({ message: "hi", repeat: 3 });
+  console.log(res.message); // "hihihi"
+} catch (e) {
+  if (e instanceof WasmRpcError) console.error(e.code, e.message);
+}
+```
+
+Streaming returns an async-iterable with a `cancel()` method — synchronously,
+not as a promise:
+
+```ts
+const stream = client.subscribe({ topic: "tick", count: 10 });
+for await (const tick of stream) {
+  if (tick.seq === 3) stream.cancel();
+}
+```
+
+## Prove it
+
+Four harnesses cover both ABIs and both compilers. Assertion counts are printed
+by the harnesses themselves.
+
+```sh
+make test                  # go vet + go test + tsc --noEmit
+make test-e2e              # real app.wasm under Node, generated TS client (11 asserts)
+make test-e2e-tinygo       # same suite, TinyGo module, panic test skipped (10 asserts)
+make test-wasip1           # wazero host driving go:wasmexport (5 asserts)
+make test-wasip1-tinygo    # same, TinyGo guest, panic test skipped (4 asserts)
+```
+
+## Run the browser demos
+
+Two Vite + React apps. `make dev` builds the Wasm module, builds `client/ts/dist`
+(the npm dep is `file:../../client/ts`), installs, and starts Vite on its default
+port `5173`.
+
+```sh
+make -C examples/web-echo dev        # unary: echo, reverse, typed error
+make -C examples/web-streaming dev   # streaming: live ticker, cancel button
+```
+
+## Where to next
+
+<CardGroup cols={2}>
+  <Card title="Server API" href="/server" icon="server">
+    Registration, dispatch, and the generic helpers.
+  </Card>
+  <Card title="Schema" href="/codegen/schema" icon="file-code">
+    The `echo.v1` and `ticker.v1` services used above.
+  </Card>
+  <Card title="Examples" href="/examples" icon="folder-open">
+    Every example, what it proves, and how to run it.
+  </Card>
+  <Card title="TinyGo" href="/tinygo" icon="feather">
+    Constraints TinyGo places on handler code.
+  </Card>
+</CardGroup>

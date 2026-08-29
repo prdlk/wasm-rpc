@@ -1,0 +1,184 @@
+---
+title: Server streaming
+description: ServerStream and Send, why client cancellation is normal termination rather than an error, and how backpressure differs between the two hosts.
+sidebar:
+  label: Streaming
+  order: 2
+---
+
+Server-streaming is the only streaming kind wasm-rpc supports. Client-streaming
+and bidi are skipped by every code generator, with a comment left in the output
+where the method would have been.
+
+## `ServerStream[T]`
+
+```go title="server/stream.go:77-88"
+type ServerStream[T proto.Message] struct{ /* unexported */ }
+
+func (s *ServerStream[T]) Context() context.Context   // stream.go:84
+func (s *ServerStream[T]) Send(m T) error              // stream.go:88
+```
+
+Both fields are unexported and the type is constructed only by
+`RegisterServerStream` — you never build one yourself.
+
+`Send` returns `s.ctx.Err()` immediately if the stream is already cancelled
+(`server/stream.go:89-91`). Otherwise it marshals the message, calls the
+host-supplied `send`, and unconditionally calls `RecycleResponse` on the
+buffer before returning the send error.
+
+:::danger[Frame bytes die when `Send` returns]
+The marshalled frame is recycled as soon as `Send` completes. Nothing may retain
+it. This is the same borrowing rule as request payloads.
+:::
+
+## A handler
+
+From `examples/server-streaming/service.go:19`:
+
+```go
+func (s *Service) Subscribe(
+	ctx context.Context,
+	req *tickerv1.SubscribeRequest,
+	stream *server.ServerStream[*tickerv1.SubscribeResponse],
+) error {
+	count := req.GetCount()
+	if count == 0 {
+		count = 3
+	}
+	if count > 10000 {
+		return server.Errorf(server.CodeInvalidArgument, "count must be <= 10000")
+	}
+
+	for seq := uint32(1); seq <= count; seq++ {
+		err := stream.Send(&tickerv1.SubscribeResponse{
+			Topic:      req.GetTopic(),
+			Seq:        seq,
+			UnixMillis: time.Now().UnixMilli(),
+		})
+		if err != nil {
+			return err // the client cancelled
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		time.Sleep(interval)
+	}
+	return nil
+}
+```
+
+Two details in that loop are deliberate and worth copying:
+
+Return the `Send` error verbatim
+: It already means "cancelled". Wrapping it or swallowing it loses the signal.
+
+Pace with `time.Sleep`, not `select` + `time.After`
+: Required for TinyGo's asyncify scheduler. See [TinyGo](/tinygo).
+
+## Cancellation is not an error
+
+This is the single most important streaming behavior in the codebase.
+
+```go title="server/stream.go:66-72 (paraphrased)"
+if err != nil && ctx.Err() != nil {
+	return nil // cancellation is normal termination
+}
+```
+
+`DispatchStream` returns `nil` when the handler errors **and** the context is
+already cancelled. Everything downstream follows from that:
+
+- The browser bridge fires `onEnd`, **never** `onError`, for a cancelled stream.
+- The TS `for await` loop simply returns rather than throwing.
+- The wasip1 host receives a `frameEnd` (status `1`), not a `frameError`.
+- The handler observes cancellation as `ctx.Done()` or a non-nil `Send` error.
+
+## Backpressure depends on the host
+
+The `ServerStream` type itself has no channel and no buffer. Buffering — if any
+— belongs to the host bridge, and the two hosts differ materially.
+
+| Host        | Model  | Buffer                                             | Effect on a fast handler                                    |
+| ----------- | ------ | -------------------------------------------------- | ----------------------------------------------------------- |
+| Browser     | push   | none; `onMessage` is invoked synchronously          | the handler runs at full speed; the JS side must keep up    |
+| wasip1      | pull   | `make(chan uint64, 16)` (`server/wasip1.go:154`)   | the handler **blocks** in `send` until the host calls `recv` |
+| TS client   | pull   | unbounded queue (`client/ts/src/client.ts:188-203`) | frames accumulate in memory if the consumer is slow         |
+
+The TS runtime declines to implement backpressure at that layer on purpose —
+the comment at `client/ts/src/client.ts:178-181` defers it to the protocol. If
+you need flow control in the browser, put a `count`/window field in your request
+message, exactly as `ticker.v1.SubscribeRequest` does.
+
+## Cancelling, per language
+
+<Tabs>
+  <Tab title="TypeScript">
+
+```ts
+const stream = client.subscribe({ topic: "tick", count: 50 });
+for await (const tick of stream) {
+  if (tick.seq === 3) stream.cancel();
+}
+```
+
+`cancel()` calls the host's `cancel(id)`, which cancels the handler's context.
+The pending `await` resolves only once the host pushes the resulting `onEnd`.
+
+  </Tab>
+  <Tab title="Go">
+
+```go
+err := c.Subscribe(ctx, req, func(t *tickerv1.SubscribeResponse) error {
+	if t.GetSeq() == 3 {
+		return context.Canceled // a non-nil return cancels the stream
+	}
+	return nil
+})
+```
+
+The callback's error cancels the stream and is returned from `Subscribe`.
+Pinned by `TestStreamCancelViaCallback` in
+`examples/server-streaming/service_test.go`.
+
+  </Tab>
+  <Tab title="Dart">
+
+```dart
+final sub = client.subscribe(req).listen(handleTick);
+await sub.cancel(); // onCancel -> wasmRPC.cancel(id)
+```
+
+  </Tab>
+  <Tab title="Kotlin">
+
+```kotlin
+val job = scope.launch { client.subscribe(req).collect { tick -> … } }
+job.cancel() // coroutine cancellation cancels the cold Flow
+```
+
+  </Tab>
+  <Tab title="Swift">
+
+```swift
+for try await tick in client.subscribe(req) {
+    if tick.seq == 3 { break } // onTermination -> task.cancel()
+}
+```
+
+  </Tab>
+</Tabs>
+
+## Panics
+
+A panicking stream handler becomes `internal` with the stack on `console.error`
+only — on big Go. `examples/server-streaming/service.go:20-22` panics
+deliberately when the topic is `"explode"`, which is what the E2E harnesses
+assert against.
+
+:::warning[TinyGo aborts instead]
+TinyGo cannot `recover()` on wasm with any scheduler. A panic aborts the whole
+module. Both TinyGo test targets pass `SKIP_PANIC=1` / `--skip-panic` for
+exactly this reason. Services targeting TinyGo must return
+`server.Errorf` instead of panicking.
+:::

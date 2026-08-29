@@ -1,0 +1,230 @@
+---
+title: Swift
+description: Sendable protocols over AsyncThrowingStream, the two-target SPM layout, and what you must supply yourself — Swift ships no concrete transport.
+sidebar:
+  label: Swift
+  order: 6
+---
+
+SPM package `wasm-rpc-client`, `swift-tools-version:5.9`, platforms iOS 15+ and
+macOS 12+ — the floor for native concurrency without back-deployment.
+
+```swift
+import WasmRpc      // protocols + error type, Foundation-only
+import WasmRpcGen   // generated clients + SwiftProtobuf messages
+```
+
+## Package layout
+
+```swift title="client/swift/Package.swift"
+let package = Package(
+    name: "wasm-rpc-client",
+    platforms: [.iOS(.v15), .macOS(.v12)],
+    products: [
+        .library(name: "WasmRpc", targets: ["WasmRpc"]),
+        .library(name: "WasmRpcGen", targets: ["WasmRpcGen"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.28.0"),
+    ],
+    targets: [
+        .target(name: "WasmRpc"),
+        .target(name: "WasmRpcGen", dependencies: [
+            "WasmRpc",
+            .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+        ]),
+    ]
+)
+```
+
+The split matters: `WasmRpc` has **no dependencies** at all. The runtime is
+`Foundation`-only and deliberately protobuf-free, so a host that wants to
+implement a transport does not pull in SwiftProtobuf.
+
+No test targets, no `Tests/`, no `Package.resolved`.
+
+## Protocols
+
+```swift title="client/swift/Sources/WasmRpc/Transport.swift"
+public protocol WasmRpcTransport: Sendable {
+    func invoke(method: String, payload: Data) async throws -> Data
+}
+
+public protocol WasmRpcStreamTransport: WasmRpcTransport {
+    func listen(method: String, payload: Data) -> AsyncThrowingStream<Data, Error>
+}
+```
+
+`WasmRpcTransport` refines `Sendable`, so every conforming transport must be safe
+to share across concurrency domains.
+
+Argument labels are **explicit and required**: `invoke(method:payload:)`,
+`listen(method:payload:)`.
+
+`listen` is neither `async` nor `throws` — it synchronously returns an
+`AsyncThrowingStream`. The error type parameter is the existential `Error`, not
+`WasmRpcError`, so consumers must cast.
+
+Documented contract: one `Data` frame per server message, finishes on end, throws
+`WasmRpcError` on error, and terminating the sequence cancels the underlying
+stream.
+
+## Errors
+
+```swift title="client/swift/Sources/WasmRpc/Transport.swift:17-26"
+public struct WasmRpcError: Error, Sendable {
+    public let code: String
+    public let method: String?
+    public let message: String
+
+    public init(code: String, method: String? = nil, message: String) { … }
+}
+```
+
+A `struct`, not an `enum`, so `code` is an open `String` — matching the wire
+contract rather than closing over four cases.
+
+:::note[No `LocalizedError` conformance]
+`WasmRpcError` does not conform to `LocalizedError`, so
+`error.localizedDescription` produces the generic Foundation fallback rather than
+`message`. Read `message` directly.
+:::
+
+```swift
+do {
+    _ = try await client.echo(req)
+} catch let e as WasmRpcError {
+    print("\(e.code): \(e.message)")
+}
+```
+
+## No concrete transport ships
+
+The `WasmRpc` target is exactly one file. There is no `WKWebViewTransport`, no
+JavaScriptCore bridge, no WasmKit or wasmtime binding — and unlike Kotlin, not
+even a comment sketch. Swift ships protocols and an error type; the embedder
+supplies the transport.
+
+## Implementing a transport
+
+```swift
+public struct WKWebViewTransport: WasmRpcStreamTransport {
+    // must be Sendable — hold an actor or an immutable handle, not a mutable ref
+
+    public func invoke(method: String, payload: Data) async throws -> Data {
+        // evaluateJavaScript("wasmRPC.invoke(...)"), base64 the payload,
+        // resume from the Promise; on rejection throw
+        // WasmRpcError(code: ..., method: method, message: ...)
+    }
+
+    public func listen(method: String, payload: Data) -> AsyncThrowingStream<Data, Error> {
+        AsyncThrowingStream { continuation in
+            let id = /* wasmRPC.listen(...) -> stream id */ 0
+            // onMessage -> continuation.yield(frame)
+            // onError   -> continuation.finish(throwing: WasmRpcError(...))
+            // onEnd     -> continuation.finish()
+            continuation.onTermination = { _ in /* wasmRPC.cancel(id) */ }
+        }
+    }
+}
+```
+
+`continuation.onTermination` is the obligation that makes cancellation work.
+Without it, breaking out of a consumer's `for try await` leaves the Go handler
+running.
+
+:::warning[Sendable is checked leniently]
+`Package.swift` sets no `swiftSettings: [.enableExperimentalFeature("StrictConcurrency")]`
+and the tools version is 5.9, so under the Swift 5 language mode the `Sendable`
+conformances are checked leniently. Under Swift 6 strict concurrency the generated
+streaming client's implicit capture of a `struct`'s stored property inside an
+escaping `Task` may need review. Nothing here is ever compiled in this
+repository, so this is unverified.
+:::
+
+## Generated client shape
+
+```swift title="client/swift/Sources/WasmRpcGen/echo/v1/echo.wasmrpc.swift"
+public struct EchoServiceClient: Sendable {
+    private let transport: any WasmRpcTransport
+
+    public init(transport: any WasmRpcTransport) {
+        self.transport = transport
+    }
+
+    public func echo(_ request: Echo_V1_EchoRequest) async throws -> Echo_V1_EchoResponse {
+        let payload = try request.serializedData()
+        let raw = try await transport.invoke(
+            method: "echo.v1.EchoService/Echo",
+            payload: payload
+        )
+        return try Echo_V1_EchoResponse(serializedBytes: raw)
+    }
+}
+```
+
+```swift title="client/swift/Sources/WasmRpcGen/ticker/v1/ticker.wasmrpc.swift"
+public struct TickerServiceClient: Sendable {
+    private let transport: any WasmRpcStreamTransport
+
+    public func subscribe(_ request: Ticker_V1_SubscribeRequest)
+        -> AsyncThrowingStream<Ticker_V1_SubscribeResponse, Error>
+    {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    let payload = try request.serializedData()
+                    for try await frame in transport.listen(
+                        method: "ticker.v1.TickerService/Subscribe",
+                        payload: payload
+                    ) {
+                        continuation.yield(try Ticker_V1_SubscribeResponse(serializedBytes: frame))
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+```
+
+Patterns to note:
+
+- `public struct <Service>Client: Sendable` holding an `any <Transport>`
+  existential, with a labeled `public init(transport:)`.
+- Unary suppresses the request label with `_`, so calls read
+  `client.echo(request)`.
+- Message types use SwiftProtobuf's prefixed naming — `echo.v1.EchoRequest`
+  becomes `Echo_V1_EchoRequest` — generated with `Visibility=Public`.
+
+:::warning[Serialization errors are deferred on streams]
+`subscribe` is non-`async` and non-`throws`, and `try request.serializedData()`
+runs **inside** the inner `Task`. So a malformed request surfaces as a stream
+failure on first iteration, not as a synchronous throw at the call site.
+:::
+
+## Usage
+
+```swift
+let echo = EchoServiceClient(transport: transport)
+var req = Echo_V1_EchoRequest()
+req.message = "hi"
+req.repeat = 2
+let res = try await echo.echo(req)
+
+let ticker = TickerServiceClient(transport: transport)
+for try await tick in ticker.subscribe(subReq) {
+    print("\(tick.topic) #\(tick.seq)")
+    if tick.seq == 3 { break } // onTermination -> task.cancel()
+}
+```
+
+:::warning[Not compiled here]
+Nothing in the Makefile runs `swift build`, there is no test target, and there is
+no `Package.resolved`. The runtime and generated clients are descriptor-derived
+and unverified in this repository. Wire `swift build` into your own CI before
+depending on them.
+:::

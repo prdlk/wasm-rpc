@@ -1,0 +1,217 @@
+---
+title: Dart
+description: The pub package — interfaces, the JsGlobalTransport built on dart:js_interop, and the caveats around web-only imports and unbounded buffering.
+sidebar:
+  label: Dart
+  order: 4
+---
+
+Package `wasm_rpc_client`, version `0.1.0`. Dart SDK `^3.4.0` — required for the
+stable `dart:js_interop` API. Single dependency: `protobuf ^4.0.0`.
+
+```dart
+import 'package:wasm_rpc_client/wasm_rpc_client.dart';
+```
+
+:::warning[The barrel is web-only]
+`lib/wasm_rpc_client.dart` re-exports `src/js_transport.dart`, which imports
+`dart:js_interop`. Importing the barrel from a Dart VM or Flutter **mobile**
+target fails to compile — there is no conditional-import shim in the package.
+
+A non-web consumer must import `package:wasm_rpc_client/src/transport.dart`
+directly, reaching into `src/`. That is unconventional but currently the only
+option.
+:::
+
+## Interfaces
+
+```dart title="client/dart/lib/src/transport.dart"
+abstract interface class WasmRpcTransport {
+  Future<Uint8List> invoke(String method, Uint8List payload);
+}
+
+abstract interface class WasmRpcStreamTransport implements WasmRpcTransport {
+  Stream<Uint8List> listen(String method, Uint8List payload);
+}
+```
+
+Both are `abstract interface class` (Dart 3 modifiers) — implementable but not
+extendable, which is why the streaming interface uses `implements` rather than
+`extends`.
+
+Documented `listen` contract: one `Uint8List` frame per server message, completes
+on end, errors with `WasmRpcException`, and cancelling the subscription cancels
+the underlying stream.
+
+## Errors
+
+```dart title="client/dart/lib/src/transport.dart:9-18"
+class WasmRpcException implements Exception {
+  final String code;
+  final String? method;
+  final String message;
+
+  const WasmRpcException(this.code, this.method, this.message);
+
+  @override
+  String toString() => 'WasmRpcException($code, $method): $message';
+}
+```
+
+`Exception`, not `Error`. The constructor is **positional**, unlike Swift's
+labeled init. `method` is the only nullable field.
+
+## `JsGlobalTransport`
+
+The only concrete transport shipped in any of the three non-Go, non-TS runtimes.
+
+```dart title="client/dart/lib/src/js_transport.dart"
+final class JsGlobalTransport implements WasmRpcStreamTransport {
+  const JsGlobalTransport();
+}
+```
+
+`final class`, so it cannot be subclassed. `const`, so constructing it anywhere
+is free — the actual singleton lives in the JS global.
+
+It binds directly to the mounted global via dotted `@JS` paths:
+
+```dart
+@JS('wasmRPC.invoke')
+external JSPromise<JSUint8Array> _invoke(String method, JSUint8Array payload);
+
+@JS('wasmRPC.listen')
+external int _listen(String method, JSUint8Array payload, JSObject handlers);
+
+@JS('wasmRPC.cancel')
+external void _cancelStream(int id);
+```
+
+So the Go entrypoint **must** have called `r.Mount("wasmRPC")` — the name is
+hardcoded here.
+
+:::warning[No readiness check]
+The doc comment states the Go module must already be instantiated
+(`wasm_exec.js` + `WebAssembly.instantiateStreaming`) before the first call. There
+is no handshake equivalent to TypeScript's `loadWasmRpc`. Calling too early throws
+whatever the JS global lookup throws — not a `WasmRpcException`.
+
+Either drive the instantiation from JS and only then enter Dart, or write your own
+readiness future around `globalThis.__wasmRPCReady`.
+:::
+
+## Unary
+
+`invoke` converts with `payload.toJS`, awaits the `JSPromise` via `.toDart`, and
+converts the result back. Rejections are decoded field-by-field off the JS error
+object, with `code` defaulting to `'unknown'` and `message` falling back to
+`e.toString()`.
+
+:::danger[Unchecked cast in the error path]
+`client/dart/lib/src/js_transport.dart:32` does `final o = e as JSObject?` on an
+arbitrary caught object. If the awaited future fails with a genuine **Dart**
+exception rather than a JS rejection, that cast itself throws a `TypeError` and
+the caller never sees a `WasmRpcException`.
+
+The TypeScript runtime guards the same case defensively
+(`typeof e === "object" && "message" in e`). Dart does not. Treat a non-
+`WasmRpcException` throw from `invoke` as possible.
+:::
+
+Also note `invoke` does **not** substitute the known `method` argument when the
+rejection omits `method`, so `e.method` can be null even though the call site
+knows it. The streaming path does substitute it.
+
+## Streaming
+
+Built on a `StreamController<Uint8List>` with the JS callbacks installed in
+`onListen`:
+
+| JS callback | Effect                                                                 |
+| ----------- | ---------------------------------------------------------------------- |
+| `onMessage` | `controller.add(m.toDart)`                                              |
+| `onError`   | builds a `WasmRpcException`, then closes the controller                 |
+| `onEnd`     | closes the controller                                                   |
+
+Cancellation is wired as `onCancel: () => _cancelStream(id)`, where `id` is the
+value `listen` returned.
+
+```dart
+final sub = client.subscribe(SubscribeRequest(topic: 'tick', count: 10))
+    .listen(handleTick);
+
+// later
+await sub.cancel(); // -> wasmRPC.cancel(id)
+```
+
+Behaviors that follow from the implementation:
+
+Single-subscription
+: A default (non-broadcast) `StreamController`. You get one listener. Use
+  `.asBroadcastStream()` if you need more.
+
+Lazy
+: `listen` is only issued on first subscribe, so no JS call happens until
+  someone listens.
+
+No backpressure
+: `onPause`/`onResume` are not wired, so a slow consumer buffers frames in the
+  controller unboundedly rather than slowing the Go handler.
+
+Terminates on first error
+: The controller closes immediately after `addError`. The stream is not a
+  resumable channel.
+
+## Generated client shape
+
+```dart title="client/dart/lib/gen/echo/v1/echo_wasmrpc.pb.dart"
+class EchoServiceClient {
+  final WasmRpcTransport _transport;
+
+  const EchoServiceClient(this._transport);
+
+  Future<EchoResponse> echo(EchoRequest request) async {
+    final raw = await _transport.invoke(
+      'echo.v1.EchoService/Echo',
+      request.writeToBuffer(),
+    );
+    return EchoResponse.fromBuffer(raw);
+  }
+}
+```
+
+```dart title="client/dart/lib/gen/ticker/v1/ticker_wasmrpc.pb.dart"
+class TickerServiceClient {
+  final WasmRpcStreamTransport _transport;
+
+  const TickerServiceClient(this._transport);
+
+  Stream<SubscribeResponse> subscribe(SubscribeRequest request) => _transport
+      .listen('ticker.v1.TickerService/Subscribe', request.writeToBuffer())
+      .map(SubscribeResponse.fromBuffer);
+}
+```
+
+Streaming methods are **not** `async`, which is what keeps the underlying JS
+`listen` deferred until subscription.
+
+## Usage
+
+```dart
+const transport = JsGlobalTransport();
+
+final echo = EchoServiceClient(transport);
+final res = await echo.echo(EchoRequest(message: 'hi', repeat: 2));
+
+final ticker = TickerServiceClient(transport);
+await for (final tick in ticker.subscribe(SubscribeRequest(count: 10))) {
+  print('${tick.topic} #${tick.seq}');
+}
+```
+
+:::warning[Not compiled here]
+The Dart package has no `dev_dependencies`, no lints package, and no
+`analysis_options.yaml`. Nothing in the Makefile runs `dart analyze` or
+`dart test`. The runtime and generated clients are descriptor-derived and
+unverified in this repository. Wire `dart analyze` into your own CI.
+:::

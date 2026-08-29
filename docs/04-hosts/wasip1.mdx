@@ -1,0 +1,234 @@
+---
+title: WASI host
+description: The go:wasmexport ABI — six exports, the packed pointer convention, the frame layout, and the pinning rules a host must obey.
+sidebar:
+  label: WASI (wasip1)
+  order: 2
+---
+
+Built with `//go:build wasip1` from `server/wasip1.go`. Requires Go >= 1.24 for
+`go:wasmexport`. `server.Attach` exists only on this target.
+
+## Building a reactor
+
+```sh
+GOOS=wasip1 GOARCH=wasm go build -buildmode=c-shared -trimpath -ldflags="-s -w" \
+  -o app.wasm ./examples/server-basic/wasip1
+
+tinygo build -target=wasip1 -buildmode=c-shared -no-debug \
+  -o app.wasm ./examples/server-basic/wasip1
+```
+
+```go title="examples/server-basic/wasip1/main.go"
+//go:build wasip1
+
+func init() {
+	r := server.NewRouter()
+	echov1.RegisterEchoServiceServer(r, basic.New())
+	server.Attach(r)
+}
+
+func main() {} // never called
+```
+
+:::danger[Register from `init()`, not `main()`]
+A `c-shared` module is a **reactor**. The host starts it by calling
+`_initialize`, which runs package inits and returns. `main` is never invoked.
+`examples/e2e/wasip1host/main.go:93-94` demonstrates this with
+`wazero.NewModuleConfig().WithStartFunctions("_initialize")`. Registration in
+`main()` silently never runs, and every call returns
+`internal: no router attached: call server.Attach in init()`.
+:::
+
+`Attach` writes a single package global with no locking — last call wins. It is
+designed for `init()` and nothing else.
+
+## The six exports
+
+| Export                 | Signature                            | Semantics                                       |
+| ---------------------- | ------------------------------------ | ----------------------------------------------- |
+| `wasmrpc_alloc`        | `(n u32) -> ptr u32`                 | guest allocates and pins an input buffer        |
+| `wasmrpc_free`         | `(ptr u32)`                          | release any guest-returned frame or input       |
+| `wasmrpc_invoke`       | `(mPtr,mLen,pPtr,pLen u32) -> u64`   | packed result frame                             |
+| `wasmrpc_stream_open`  | `(mPtr,mLen,pPtr,pLen u32) -> id u32`| starts the handler goroutine                    |
+| `wasmrpc_stream_recv`  | `(id u32) -> u64`                    | **blocking** pull of the next frame             |
+| `wasmrpc_stream_cancel`| `(id u32)`                           | cancels the handler context                     |
+
+Declared at `server/wasip1.go:68`, `:73`, `:105`, `:140`, `:193`, `:214`.
+
+## Packed return values
+
+```
+uint64(ptr) << 32 | uint64(len(frame))
+```
+
+High 32 bits are the linear-memory offset; low 32 bits are the length. The
+**length includes the status byte** (`server/wasip1.go:98`).
+
+```go title="examples/e2e/wasip1host/main.go:54-63"
+ptr := uint32(packed >> 32)
+n := uint32(packed)
+raw, _ := mod.Memory().Read(ptr, n)
+status := raw[0]
+payload := append([]byte(nil), raw[1:]...) // copy before freeing
+call("wasmrpc_free", uint64(ptr))
+```
+
+## Frame layout
+
+```
+[status u8][payload...]
+```
+
+| Status | Meaning | Payload                            |
+| ------ | ------- | ---------------------------------- |
+| `0`    | message | the marshalled protobuf response   |
+| `1`    | end     | empty                              |
+| `2`    | error   | `code "\n" method "\n" message`    |
+
+Split the error payload with a **limit of 3** — the message may itself contain
+newlines.
+
+## Pinning: the hard host constraint
+
+Every pointer the guest hands out is registered in a `keepAlive` map keyed by
+base address (`server/wasip1.go:52-66`). The internal `pinned(ptr, n)` helper
+returns `nil` when:
+
+- `n == 0`
+- `ptr` is not a registered **base** pointer
+- the pinned buffer is shorter than `n`
+
+:::danger[Buffers must come from `wasmrpc_alloc`]
+Hosts **must** obtain input buffers from `wasmrpc_alloc` and pass them at their
+**exact base offset**. Writing to an arbitrary linear-memory address and passing
+that offset yields
+`invalid_argument: method buffer not allocated via wasmrpc_alloc`.
+
+Hosts must also `wasmrpc_free` every returned frame and every allocated input
+after the consuming call (`server/wasip1.go:33-35`). `alloc(0)` and empty slices
+pin to pointer `0`.
+:::
+
+## Unary call sequence
+
+```mermaid
+sequenceDiagram
+  participant H as host
+  participant G as guest
+  H->>G: wasmrpc_alloc(len(method)) -> mPtr
+  H->>G: write method bytes at mPtr
+  H->>G: wasmrpc_alloc(len(payload)) -> pPtr
+  H->>G: write payload bytes at pPtr
+  H->>G: wasmrpc_invoke(mPtr, mLen, pPtr, pLen) -> packed
+  G-->>H: ptr<<32 | len
+  H->>H: read [status][payload], copy it out
+  H->>G: wasmrpc_free(framePtr)
+  H->>G: wasmrpc_free(mPtr); wasmrpc_free(pPtr)
+```
+
+On success the guest packs `frameOK` and then calls `RecycleResponse(out)`, so
+the pooled marshal buffer is reused (`server/wasip1.go:119-121`).
+
+## Streams are pull-based with real backpressure
+
+This is the one place wasm-rpc gives you genuine flow control.
+
+```go title="server/wasip1.go:154"
+st.frames = make(chan uint64, 16)
+```
+
+The handler goroutine **blocks in `send`** until the host drains via
+`wasmrpc_stream_recv`. A fast handler cannot outrun a slow host.
+
+Other stream mechanics:
+
+- `stream_open` **defensively copies** the payload
+  (`append([]byte(nil), p...)`, `server/wasip1.go:150`) because the host may free
+  its input immediately after the call returns.
+- Ids are pre-incremented, so they start at `1`.
+- The goroutine always pushes exactly **one** terminal frame — `frameError` or
+  `frameEnd` — then closes the channel. A closed channel synthesizes an end
+  frame, so `recv` never blocks forever.
+- Any non-`frameOK` status **drops the registry entry**
+  (`server/wasip1.go:206-210`). The id is dead after the terminal frame; a
+  further `recv` returns `invalid_argument: unknown stream id`.
+- `stream_cancel` deletes the entry **before** calling cancel
+  (`server/wasip1.go:216-221`). A post-cancel `recv` therefore returns
+  `unknown stream id` rather than a terminal frame.
+
+:::warning[Stop polling after cancel]
+Because cancel removes the registry entry first, a host that keeps calling
+`recv` after `stream_cancel` gets an error frame, not a clean end. Treat
+`stream_cancel` as terminal on the host side.
+:::
+
+## Stream loop, as the reference host writes it
+
+```go title="examples/e2e/wasip1host/main.go:111-131 (shape)"
+id := call("wasmrpc_stream_open", mPtr, mLen, pPtr, pLen)
+for {
+	status, payload := frame(call("wasmrpc_stream_recv", id))
+	if status == frameEnd {
+		break
+	}
+	if status == frameError {
+		parts := strings.SplitN(string(payload), "\n", 3)
+		log.Fatalf("rpc %s: %s", parts[0], parts[2])
+	}
+	var resp tickerv1.SubscribeResponse
+	must(proto.Unmarshal(payload, &resp))
+	// ...
+}
+```
+
+## The reference host
+
+`examples/e2e/wasip1host/` is a complete wazero-embedded host and is a **separate
+Go module** — `github.com/prdlk/wasm-rpc/examples/e2e/wasip1host`, requiring
+`github.com/tetratelabs/wazero v1.9.0` with
+`replace github.com/prdlk/wasm-rpc => ../../..`. Keeping it out of the root
+module is why wazero never becomes a dependency of the library.
+
+```go title="Instantiation, examples/e2e/wasip1host/main.go:89-94"
+rt := wazero.NewRuntime(ctx)
+wasi_snapshot_preview1.MustInstantiate(ctx, rt)
+mod, err := rt.InstantiateWithConfig(ctx, wasmBytes,
+	wazero.NewModuleConfig().
+		WithStartFunctions("_initialize").
+		WithStderr(os.Stderr).
+		WithStdout(os.Stdout))
+```
+
+It asserts five things:
+
+<Steps>
+  <Step title="Unary round-trip">
+    `Echo{Message:"wasi", Repeat:2}` returns `"wasiwasi"`.
+  </Step>
+  <Step title="Typed error">
+    `Echo{Repeat:9999}` returns an error containing `invalid_argument`.
+  </Step>
+  <Step title="Server stream">
+    `Subscribe{Topic:"tick", Count:4}` yields four `frameOK` frames with
+    `seqs[0] == 1` and `seqs[3] == 4`, then `frameEnd`.
+  </Step>
+  <Step title="Panic recovery">
+    `Subscribe{Topic:"explode"}` yields a `frameError` whose payload starts with
+    `internal\n`. Skipped by `--skip-panic`.
+  </Step>
+  <Step title="Module survival">
+    A further `Echo{Message:"alive"}` still round-trips after the panic.
+  </Step>
+</Steps>
+
+```sh
+make test-wasip1          # 5/5 via wazero
+make test-wasip1-tinygo   # 4/4, panic recovery skipped
+```
+
+:::note[`--skip-panic` is positional]
+`examples/e2e/wasip1host/main.go:137` reads
+`len(os.Args) > 2 && os.Args[2] == "--skip-panic"`. It must be the **second**
+argument, immediately after the module path.
+:::

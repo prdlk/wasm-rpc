@@ -1,0 +1,130 @@
+---
+title: Schema
+description: The two proto packages this repository ships — echo.v1 for unary, ticker.v1 for server-streaming — with every field and handler behavior.
+sidebar:
+  label: Schema
+  order: 3
+---
+
+Two modules live under `proto/`, one per RPC kind. Between them they exercise
+every path in the runtime, which is why the E2E harnesses register both on a
+single router.
+
+## `echo.v1` — unary
+
+```proto title="proto/echo/v1/echo.proto"
+package echo.v1;
+
+option go_package = "github.com/prdlk/wasm-rpc/gen/go/echo/v1;echov1";
+
+service EchoService {
+  rpc Echo(EchoRequest) returns (EchoResponse);
+  rpc Reverse(ReverseRequest) returns (ReverseResponse);
+}
+```
+
+Both methods are unary, so the generated `EchoServiceClient` takes the **narrow**
+transport.
+
+| Message           | Fields                                              |
+| ----------------- | --------------------------------------------------- |
+| `EchoRequest`     | `string message = 1`, `uint32 repeat = 2`            |
+| `EchoResponse`    | `string message = 1`, `int64 unix_millis = 2`        |
+| `ReverseRequest`  | `string message = 1`                                 |
+| `ReverseResponse` | `string message = 1`, `int64 unix_millis = 2`        |
+
+No `java_package`, `java_multiple_files`, or Swift options are set. Consequences:
+the Kotlin package falls back to `echo.v1`, the Java outer class is `Echo` (so
+messages are `Echo.EchoRequest`), and the Swift prefix is `Echo_V1_`.
+
+:::note[`int64` becomes `bigint` in TypeScript]
+`unix_millis` arrives as a JS `bigint`, not a `number`. The examples do
+`Number(res.unixMillis)` before arithmetic
+(`examples/e2e/e2e.mjs:53`).
+:::
+
+### Handler behavior
+
+`examples/server-basic/service.go` attaches deliberate behaviors so the harnesses
+have something to assert:
+
+| Input                          | Result                                                     |
+| ------------------------------ | ---------------------------------------------------------- |
+| `repeat > 1000`                | `invalid_argument: repeat must be <= 1000`                  |
+| `repeat > 1`                   | message repeated N times via `strings.Repeat`               |
+| `Reverse` with multi-byte text | reversed over `[]rune`, so UTF-8 survives                   |
+
+The rune-safe reversal is verified across the real boundary:
+`reverse("héllo🚀")` must yield `"🚀olléh"` (`examples/e2e/e2e.mjs:56-57`).
+
+## `ticker.v1` — server-streaming
+
+```proto title="proto/ticker/v1/ticker.proto"
+package ticker.v1;
+
+option go_package = "github.com/prdlk/wasm-rpc/gen/go/ticker/v1;tickerv1";
+
+service TickerService {
+  rpc Subscribe(SubscribeRequest) returns (stream SubscribeResponse);
+}
+```
+
+The repository's only streaming method, so `TickerServiceClient` takes the
+**wide** transport in every language.
+
+| Message             | Fields                                                                      |
+| ------------------- | --------------------------------------------------------------------------- |
+| `SubscribeRequest`  | `string topic = 1`, `uint32 count = 2`, `uint32 interval_ms = 3`             |
+| `SubscribeResponse` | `string topic = 1`, `uint32 seq = 2`, `int64 unix_millis = 3`                |
+
+### Handler behavior
+
+From `examples/server-streaming/service.go`:
+
+| Input                | Result                                              |
+| -------------------- | --------------------------------------------------- |
+| `count == 0`         | defaults to `3`                                     |
+| `count > 10000`      | `invalid_argument: count must be <= 10000`          |
+| `interval_ms == 0`   | defaults to `1ms`                                   |
+| `interval_ms > 10s`  | `invalid_argument`                                  |
+| `topic == "explode"` | **panics deliberately**, to exercise recovery       |
+
+`count` doubles as the flow-control window. Since the browser bridge has no
+backpressure, bounding the stream in the request message is the intended pattern.
+
+## No client-streaming or bidi anywhere
+
+Neither proto declares a client-streaming or bidi method, so the skip branches in
+all five emitters are unexercised by the repository's own schemas. If you add one,
+expect a comment where the method would be and no client method at all.
+
+## Method names on the wire
+
+The three identifiers the router registers, and the exact strings the E2E harness
+asserts (`examples/e2e/e2e.mjs:44-48`):
+
+```
+echo.v1.EchoService/Echo
+echo.v1.EchoService/Reverse
+ticker.v1.TickerService/Subscribe
+```
+
+:::warning[The README's examples are stale]
+`README.md` shows `client.watch(...)` with `WatchRequest`/`WatchResponse` in
+several snippets. No such method or message exists in this repository. The only
+server-streaming RPC is `Subscribe` on `ticker.v1.TickerService`, generating
+`subscribe` / `Subscribe` per language. Treat the README's `watch` as a
+placeholder for `<lowerCamel(Method)>`.
+:::
+
+## Lint constraints
+
+`buf.yaml` sets `lint.use: [STANDARD]`, which is why both packages carry a `.v1`
+suffix and both services end in `Service`. Adding
+`proto/orders/order.proto` with `package orders;` fails `make lint`. Breaking
+detection is `breaking.use: [FILE]`, checked against `main`:
+
+```sh
+make lint       # buf lint
+make breaking   # buf breaking --against '.git#branch=main'
+```

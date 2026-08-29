@@ -1,0 +1,70 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+      - "blume.config.ts"
+      - "package.json"
+      - "bun.lock"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Least privilege for the build job; the deploy job needs `pages: write`
+# and `id-token: write` for the OIDC token actions/deploy-pages exchanges.
+permissions:
+  contents: read
+
+# One Pages deployment at a time. Do not cancel in-flight deploys — a
+# half-published site is worse than a queued one.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Blume derives "Last updated on ..." from commit dates when
+          # `lastModified` is enabled; a shallow clone has none.
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.0"
+
+      # Blume requires Node 22.12+; the `blume` bin runs under node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - run: bun install --frozen-lockfile
+
+      - name: Build docs
+        run: bun run build
+
+      # Fails the job on broken internal links and missing anchors.
+      - name: Validate links
+        run: bunx blume validate
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

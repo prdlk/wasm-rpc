@@ -1,0 +1,152 @@
+---
+title: Codegen
+description: One buf generate produces twelve outputs — message stubs for five languages plus wasm-rpc bindings from a first-party plugin.
+sidebar:
+  label: Pipeline
+  order: 1
+---
+
+```sh
+make lint generate   # buf lint && buf generate
+```
+
+`buf.yaml` is the **only** module config in the repository. There is no
+`proto/buf.yaml` — in buf v2 the workspace root declares its modules.
+
+```yaml title="buf.yaml"
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE
+```
+
+`STANDARD` is what forces every package to carry a `.v1` version suffix and
+every service to end in `Service`. Check compatibility against `main` with:
+
+```sh
+make breaking   # buf breaking --against '.git#branch=main'
+```
+
+## What one pass produces
+
+`buf.gen.yaml` sets `clean: true`, so each output directory is wiped and
+rewritten every run.
+
+### Message stubs
+
+| Plugin                      | Output                             | Options                                    |
+| --------------------------- | ---------------------------------- | ------------------------------------------ |
+| `protoc-gen-go`             | `gen/go`                           | `paths=source_relative`                    |
+| `protoc-gen-go-vtproto`     | `gen/go`                           | `features=marshal+unmarshal+size`          |
+| `protoc-gen-es`             | `client/ts/gen`                    | `target=ts`                                |
+| `buf.build/protocolbuffers/dart`   | `client/dart/lib/gen`       | —                                          |
+| `buf.build/protocolbuffers/java`   | `client/kotlin/gen/java`    | —                                          |
+| `buf.build/protocolbuffers/kotlin` | `client/kotlin/gen/kotlin`  | —                                          |
+| `buf.build/apple/swift`     | `client/swift/Sources/WasmRpcGen`  | `Visibility=Public`                        |
+
+The Dart, Java, Kotlin, and Swift plugins are **BSR remote plugins**, so no local
+Dart/JVM/Swift toolchain is needed for codegen. `protoc-gen-go-vtproto` runs
+through the `go.mod` `tool` directive (`go tool protoc-gen-go-vtproto`) — nothing
+to install.
+
+:::note[vtprotobuf is load-bearing]
+`features=marshal+unmarshal+size` is not an optimization flag you can drop. The
+runtime asserts `MarshalVT`/`UnmarshalVT` to bypass protobuf reflection, and
+`reflect.NewAt` inside `protobuf-go` crashes TinyGo. Without vtprotobuf, TinyGo
+builds fail at runtime.
+:::
+
+### wasm-rpc bindings
+
+Five passes of the same first-party plugin, one per language:
+
+```yaml title="buf.gen.yaml:24-38"
+- local: [go, run, ./cmd/protogen-wasm]
+  out: gen/go
+  opt: [lang=go, paths=source_relative]
+- local: [go, run, ./cmd/protogen-wasm]
+  out: client/ts/gen
+  opt: lang=ts
+- local: [go, run, ./cmd/protogen-wasm]
+  out: client/dart/lib/gen
+  opt: lang=dart
+- local: [go, run, ./cmd/protogen-wasm]
+  out: client/kotlin/gen/kotlin
+  opt: lang=kotlin
+- local: [go, run, ./cmd/protogen-wasm]
+  out: client/swift/Sources/WasmRpcGen
+  opt: lang=swift
+```
+
+Only the `go` pass passes `paths=source_relative`; the other four construct their
+own output paths. See [protogen-wasm](/codegen/protogen-wasm) for what each
+emitter produces.
+
+## Generated vs committed
+
+This trips people up, so it is worth stating plainly.
+
+| Path                              | Committed? | Deleted by `make clean`? |
+| --------------------------------- | ---------- | ------------------------ |
+| `gen/`                            | **yes**    | yes                      |
+| `client/ts/gen/`                  | **yes**    | yes                      |
+| `client/dart/lib/gen/`            | **yes**    | yes                      |
+| `client/kotlin/gen/`              | **yes**    | yes                      |
+| `client/swift/Sources/WasmRpcGen/echo`, `/ticker` | **yes** | yes  |
+| `client/ts/dist/`, `build/`, `bin/`, `dist/` | no (gitignored) | yes |
+
+:::warning
+`make clean` deletes committed generated code, leaving the working tree dirty
+and `go test ./...` unable to compile. Re-run `buf generate` afterwards.
+`server/router_test.go` imports `gen/go/echo/v1` directly.
+:::
+
+## Adding a service
+
+<Steps>
+  <Step title="Write the proto">
+    Put it under `proto/<name>/v1/`. Package must be `<name>.v1` and the service
+    name must end in `Service` — `STANDARD` lint enforces both.
+  </Step>
+  <Step title="Set go_package">
+    `option go_package = "github.com/prdlk/wasm-rpc/gen/go/<name>/v1;<name>v1";`
+  </Step>
+  <Step title="Generate">
+    `make lint generate`. All twelve outputs refresh.
+  </Step>
+  <Step title="Implement the server interface">
+    Satisfy the generated `<Service>Server` interface. No build tags — keep the
+    service package portable.
+  </Step>
+  <Step title="Register it">
+    Call `Register<Service>Server(r, impl)` from your `wasm` and `wasip1`
+    entrypoints.
+  </Step>
+</Steps>
+
+:::note[Only services generate files]
+`cmd/protogen-wasm/main.go:38` skips any file where `!f.Generate` or
+`len(f.Services) == 0`. A message-only proto emits **no** wasm-rpc file in any
+language — which is correct, just occasionally surprising.
+:::
+
+## Limits
+
+Client streaming and bidi
+: Skipped in every backend, with a comment left where the method would be. Not a
+  TODO — the Wasm boundary has no upstream frame channel.
+
+Protobuf editions
+: Unsupported. The plugin advertises only `FEATURE_PROTO3_OPTIONAL`
+  (`cmd/protogen-wasm/main.go:32`), so editions syntax is rejected.
+
+TypeScript output directory
+: `genTS` derives its runtime import depth from the proto path and hardcodes
+  `src/client.js` as a sibling of the output directory
+  (`internal/codegen/clients.go:22-26`). Any output directory other than
+  `client/ts/gen` produces broken imports.

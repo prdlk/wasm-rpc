@@ -1,0 +1,266 @@
+---
+title: protogen-wasm
+description: The first-party plugin — its one parameter, the five emitters, and the exact symbol names each produces so you can predict output for a new service.
+sidebar:
+  label: protogen-wasm
+  order: 2
+---
+
+## The plugin
+
+`cmd/protogen-wasm` is a thin protoc/buf plugin shell around a language-keyed
+dispatch table.
+
+```go title="cmd/protogen-wasm/main.go:29-36"
+lang := flags.String("lang", "go", "target language: go|ts|dart|kotlin|swift")
+opts := protogen.Options{ParamFunc: flags.Set}
+// ...
+gen, ok := codegen.Languages[*lang]
+if !ok {
+	return fmt.Errorf("protogen-wasm: unknown lang %q", *lang)
+}
+```
+
+| Parameter               | Declared by            | Notes                                                                 |
+| ----------------------- | ---------------------- | --------------------------------------------------------------------- |
+| `lang`                  | the plugin             | `go` (default), `ts`, `dart`, `kotlin`, `swift`                       |
+| `paths=source_relative` | `protogen.Options.New` | consumed upstream; affects `lang=go` output placement only            |
+| `M<file>=<import>`, `module`, `annotate_code` | `protogen.Options.New` | standard protobuf-go handling |
+
+Anything else reaches `flags.Set` and fails with protogen's `unknown parameter`
+error. An unknown `lang` aborts `buf generate` with
+`protogen-wasm: unknown lang "xyz"`.
+
+## The wire method name
+
+One helper produces the identifier every backend bakes in:
+
+```go title="internal/codegen/codegen.go:26-28"
+func fullMethod(s *protogen.Service, m *protogen.Method) string {
+	return string(s.Desc.FullName()) + "/" + string(m.Desc.Name())
+}
+```
+
+So `"<proto.package>.<Service>/<Method>"`. This matches the router's key space
+exactly.
+
+:::warning[Proto name, not Go name]
+The identifier uses `m.Desc.Name()` — the **proto** method name. A proto method
+`do_thing` produces the wire id `pkg.v1.Service/do_thing` while the generated Go
+symbol is `DoThing`. Rename a proto method and you break the wire.
+:::
+
+## Naming helpers
+
+`lowerCamel` (`internal/codegen/codegen.go:55-60`) lowercases the **first byte
+only** — no acronym handling. `Echo` becomes `echo`, `DoThing` becomes
+`doThing`, and `HTTPGet` becomes `hTTPGet`. `upperCamel` splits on `_`, `-`, and
+`.`, then uppercases each part: `my_api` becomes `MyApi`.
+
+## File suffixes
+
+| lang     | Emitted path                                      | Source              |
+| -------- | ------------------------------------------------- | ------------------- |
+| `go`     | `<GeneratedFilenamePrefix>_wasmrpc.pb.go`         | `golang.go:31`      |
+| `ts`     | `<proto-path-no-ext>_wasmrpc.pb.ts`               | `clients.go:20`     |
+| `dart`   | `<proto-path-no-ext>_wasmrpc.pb.dart`             | `clients.go:114`    |
+| `kotlin` | `<dir>/<UpperCamelBasename>WasmClient.kt`         | `clients.go:188-193`|
+| `swift`  | `<proto-path-no-ext>.wasmrpc.swift`               | `clients.go:270`    |
+
+Note Kotlin derives its filename from the **proto file basename**, not the
+service — two services in one file share one `.kt` file. And Swift uses a
+dot-separated suffix, unlike the underscore form everywhere else.
+
+### Why `_wasmrpc.pb.go` and not `_wasm.pb.go`
+
+`go/build` strips a filename extension by cutting at the **first** dot. So
+`echo_wasm.pb.go` yields the stem `echo_wasm`, whose `_wasm` suffix is an
+implicit build constraint matching only `GOARCH=wasm`. The file would be
+invisible to a `GOOS=linux` build — silently breaking the deliberately
+platform-independent router and its native tests. `_wasmrpc` is not a recognized
+`GOOS`/`GOARCH` token, so no constraint fires.
+
+:::note[Stale plugin comments]
+`internal/codegen/golang.go:27`, `clients.go:15`, and `clients.go:109` still
+describe the output as `_wasm.pb.go` / `_wasm.pb.ts` / `_wasm.pb.dart`. The code
+emits `_wasmrpc.pb.*`. The comments are wrong, ironically about the exact hazard
+the naming avoids.
+:::
+
+## The transport-widening rule
+
+A generated client takes the **stream** transport if and only if its service
+contains at least one server-streaming method — a whole-service decision, not
+per-method.
+
+| Language   | Narrow                | Wide                        |
+| ---------- | --------------------- | --------------------------- |
+| Go         | `Transport`           | `StreamTransport`           |
+| Dart       | `WasmRpcTransport`    | `WasmRpcStreamTransport`    |
+| Kotlin     | `WasmRpcTransport`    | `WasmRpcStreamTransport`    |
+| Swift      | `any WasmRpcTransport`| `any WasmRpcStreamTransport`|
+| TypeScript | `WasmRpcTransport`    | `WasmRpcTransport` — see below |
+
+TypeScript is the exception. There is a single concrete `WasmRpcTransport` class,
+and streaming capability is checked at **runtime** — `streamHost`
+(`client/ts/src/client.ts:163-172`) throws an `unimplemented` `WasmRpcError`
+synchronously if the host lacks `listen`/`cancel`, because those keys are
+optional on the host interface.
+
+## Per-emitter output
+
+<Tabs>
+  <Tab title="Go">
+
+Emitted into `f.GoImportPath` — the **same package** as the `protoc-gen-go`
+messages, so no message imports are needed.
+
+| Symbol         | Form                                              |
+| -------------- | ------------------------------------------------- |
+| method const   | `<S><M>Method`                                    |
+| server iface   | `<S>Server`                                       |
+| register fn    | `Register<S>Server(r *server.Router, s <S>Server)`|
+| client type    | `<S>Client`                                       |
+| constructor    | `New<S>Client(t <Transport>) *<S>Client`          |
+| methods        | `<M>` verbatim (`m.GoName`, UpperCamel)           |
+
+```go
+// unary
+M(context.Context, *Req) (*Resp, error)
+// server-streaming, server side
+M(context.Context, *Req, *server.ServerStream[*Resp]) error
+// server-streaming, client side
+M(ctx context.Context, req *Req, fn func(*Resp) error) error
+```
+
+Client/bidi: the interface gets a comment line
+`// M: client/bidi streaming is not supported by wasm-rpc; skipped.`, the
+register body gets nothing, and the client method is silently absent.
+
+:::note
+`internal/codegen/golang.go:64` emits the comment
+`"Register<S>Server wires every unary method to the router."` — inaccurate; it
+also wires server-streaming methods via `RegisterServerStream`.
+:::
+
+  </Tab>
+  <Tab title="TypeScript">
+
+RPCs become `readonly` **fields**, not methods, whose types are inferred from
+the factory return.
+
+```ts title="client/ts/gen/echo/v1/echo_wasmrpc.pb.ts"
+import { unary, type WasmRpcTransport } from "../../../src/client.js";
+import { EchoRequestSchema, EchoResponseSchema, /* … */ } from "./echo_pb.js";
+
+/** Typed wasm-rpc client for echo.v1.EchoService. */
+export class EchoServiceClient {
+  readonly echo;
+  readonly reverse;
+
+  constructor(transport: WasmRpcTransport) {
+    this.echo = unary(transport, "echo.v1.EchoService/Echo",
+      EchoRequestSchema, EchoResponseSchema);
+    this.reverse = unary(transport, "echo.v1.EchoService/Reverse",
+      ReverseRequestSchema, ReverseResponseSchema);
+  }
+}
+```
+
+The runtime import depth is computed from the proto path
+(`"../".repeat(depth+1) + "src/client.js"`), which is why in-repo files reach
+into `../../../src/client.js` while external consumers import
+`@prdlk/wasm-rpc-client`.
+
+Known wart: streaming files import `unary` unconditionally
+(`internal/codegen/clients.go:31-34`) even when unused. Harmless under the
+project's `tsconfig`, but it trips `eslint no-unused-vars`.
+
+  </Tab>
+  <Tab title="Dart">
+
+```dart
+class TickerServiceClient {
+  final WasmRpcStreamTransport _transport;
+
+  const TickerServiceClient(this._transport);
+
+  Stream<SubscribeResponse> subscribe(SubscribeRequest request) => _transport
+      .listen('ticker.v1.TickerService/Subscribe', request.writeToBuffer())
+      .map(SubscribeResponse.fromBuffer);
+}
+```
+
+Constructor is `const` and positional. Unary methods are
+`Future<Resp> <lowerCamel>(Req request) async`; streaming methods are **not**
+`async`, so the underlying `listen` is deferred until subscription.
+
+  </Tab>
+  <Tab title="Kotlin">
+
+```kotlin
+package ticker.v1
+
+class TickerServiceClient(private val transport: WasmRpcStreamTransport) {
+    fun subscribe(request: Ticker.SubscribeRequest): Flow<Ticker.SubscribeResponse> =
+        transport
+            .listen("ticker.v1.TickerService/Subscribe", request.toByteArray())
+            .map(Ticker.SubscribeResponse::parseFrom)
+}
+```
+
+Package comes from `java_package`, else the proto package verbatim. Message types
+are qualified by the Java outer class (`Ticker.SubscribeResponse`) unless
+`java_multiple_files` is set — those outer classes come from `gen/java`, so a
+Kotlin-only build would not have them.
+
+Unary is `suspend fun`; streaming is a **non-suspend** function returning a cold
+`Flow`. Streaming files also import `WasmRpcTransport` unconditionally, leaving
+an unused import.
+
+  </Tab>
+  <Tab title="Swift">
+
+```swift
+public struct TickerServiceClient: Sendable {
+    private let transport: any WasmRpcStreamTransport
+
+    public init(transport: any WasmRpcStreamTransport) { … }
+
+    public func subscribe(_ request: Ticker_V1_SubscribeRequest)
+        -> AsyncThrowingStream<Ticker_V1_SubscribeResponse, Error>
+    {
+        AsyncThrowingStream { continuation in
+            let task = Task { … }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+}
+```
+
+Message types use SwiftProtobuf's prefixed naming — `echo.v1.EchoRequest`
+becomes `Echo_V1_EchoRequest`. The unary request label is suppressed with `_`.
+
+Streaming is non-`async` and non-`throws`, so request-serialization errors
+surface as a **stream failure** rather than a synchronous throw — they happen
+inside the inner `Task`.
+
+  </Tab>
+</Tabs>
+
+## Predicting output
+
+For a new `proto/orders/v2/order_api.proto`, package `orders.v2`, service
+`OrderService` with a unary `PlaceOrder` and a streaming `WatchOrders`:
+
+- Wire ids: `orders.v2.OrderService/PlaceOrder`,
+  `orders.v2.OrderService/WatchOrders`
+- Go: `gen/go/orders/v2/order_api_wasmrpc.pb.go` — `OrderServiceServer`,
+  `RegisterOrderServiceServer`, `OrderServiceClient` over `StreamTransport`
+- TS: `client/ts/gen/orders/v2/order_api_wasmrpc.pb.ts` — `OrderServiceClient`
+  with `readonly placeOrder` and `readonly watchOrders`
+- Dart: `client/dart/lib/gen/orders/v2/order_api_wasmrpc.pb.dart`
+- Kotlin: `client/kotlin/gen/kotlin/orders/v2/OrderApiWasmClient.kt`, package
+  `orders.v2` (note `order_api` becomes `OrderApi`)
+- Swift: `client/swift/Sources/WasmRpcGen/orders/v2/order_api.wasmrpc.swift` with
+  `Orders_V2_`-prefixed message types

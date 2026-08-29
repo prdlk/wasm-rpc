@@ -1,0 +1,106 @@
+---
+title: Clients
+description: Five hand-written runtimes sharing one shape — a byte-level transport pair and an error type — plus an honest account of which are actually compiled in CI.
+sidebar:
+  label: Overview
+  order: 1
+---
+
+Every client runtime is deliberately tiny. Each defines the same three things:
+
+`WasmRpcTransport`
+: Unary only. Takes a method string and opaque bytes, returns opaque bytes.
+
+`WasmRpcStreamTransport`
+: Extends the above with `listen`, mapping onto the language's stream primitive.
+
+An error type
+: Carries the `{code, method, message}` triple from the wire.
+
+Protobuf serialization lives entirely in the **generated** client, never in the
+runtime. That separation is what lets the same generated code run over the
+browser bridge, the WASI ABI, and an in-process loopback.
+
+## The seam, per language
+
+| Language   | Unary                                                        | Server stream                                                        |
+| ---------- | ------------------------------------------------------------ | -------------------------------------------------------------------- |
+| Go         | `Invoke(ctx, method string, payload []byte) ([]byte, error)`  | `Listen(ctx, method, payload, onMsg func([]byte) error) error`        |
+| TypeScript | `invoke(method, payload): Promise<Uint8Array>`                | `listenRaw(method, payload): WasmRpcStream<Uint8Array>`               |
+| Dart       | `Future<Uint8List> invoke(String method, Uint8List payload)`  | `Stream<Uint8List> listen(String method, Uint8List payload)`          |
+| Kotlin     | `suspend fun invoke(method: String, payload: ByteArray): ByteArray` | `fun listen(method: String, payload: ByteArray): Flow<ByteArray>` |
+| Swift      | `func invoke(method: String, payload: Data) async throws -> Data` | `func listen(method: String, payload: Data) -> AsyncThrowingStream<Data, Error>` |
+
+Note the two pull-model languages put the stream primitive **outside** the async
+context: Kotlin's `listen` is not `suspend`, and Swift's is neither `async` nor
+`throws`. Both return a cold sequence, so nothing happens until you collect it.
+
+## Which transport a generated client wants
+
+A generated client takes the **stream** transport if and only if its service has
+at least one server-streaming method — a whole-service decision. So
+`EchoServiceClient` accepts the narrow transport and `TickerServiceClient`
+requires the wide one.
+
+TypeScript is the exception: one concrete `WasmRpcTransport` class, with
+streaming capability checked at runtime.
+
+## What ships, honestly
+
+<CardGroup cols={2}>
+  <Card title="TypeScript" href="/clients/typescript" icon="file-code">
+    Full runtime, a browser bootstrap (`loadWasmRpc`), and a concrete transport.
+    **Compiled and E2E-tested.**
+  </Card>
+  <Card title="Go" href="/clients/go" icon="file-code">
+    Interfaces plus an in-process `Loopback`. **Compiled and unit-tested.**
+  </Card>
+  <Card title="Dart" href="/clients/dart" icon="file-code">
+    Interfaces plus one concrete transport, `JsGlobalTransport`, over
+    `dart:js_interop`. Not compiled here.
+  </Card>
+  <Card title="Kotlin" href="/clients/kotlin" icon="file-code">
+    Interfaces and an exception type. **No concrete transport ships.**
+  </Card>
+  <Card title="Swift" href="/clients/swift" icon="file-code">
+    Protocols and an error struct. **No concrete transport ships.**
+  </Card>
+</CardGroup>
+
+:::warning[Verification status]
+Only Go and TypeScript are built or tested in this repository. Evidence: the
+Makefile's `test` target runs exactly `go vet ./...`, `go test ./...`, and
+`tsc --noEmit` for `client/ts`; the `.PHONY` list has no `dart`, `kotlin`, or
+`swift` target; Kotlin has no Gradle wrapper; Swift has no `Package.resolved` and
+no test target; Dart has no `analysis_options.yaml`.
+
+The Dart, Kotlin, and Swift runtimes and their generated clients are
+**descriptor-derived but never compiled**. Wire `dart analyze`, Gradle, and
+`swift build` into your own CI before depending on them.
+:::
+
+## The cross-language invariant
+
+The `{code, method, message}` triple originates at `server/errors.go` and each
+runtime re-materializes it locally. It holds field-for-field in Go, TypeScript,
+Dart, and Swift.
+
+It does **not** hold in Kotlin: `WasmRpcException` folds the message into
+`Exception("$code: $message")`, so `message` is not a recoverable property. See
+[Errors](/server/errors#per-language-error-type).
+
+## Frame lifetime
+
+Frame bytes are **borrowed**, not owned, in every language. The Go side recycles
+the buffer as soon as the callback or send returns. Anything that outlives the
+callback must copy.
+
+| Runtime    | Rule                                                                   |
+| ---------- | ---------------------------------------------------------------------- |
+| Go         | `Listen`'s `onMsg` frames are valid only during the callback            |
+| TypeScript | frames are copied into a fresh `Uint8Array` by the bridge, then queued  |
+| Dart       | `m.toDart` materializes at callback time; retain past it and you must copy |
+
+The Go loopback deliberately copies and then calls `server.RecycleResponse`
+(`client/go/transport.go:41-43`) so an in-process test exercises the same
+aliasing discipline as the real bridge.

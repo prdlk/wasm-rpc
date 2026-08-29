@@ -1,0 +1,204 @@
+---
+title: Kotlin
+description: Coroutine interfaces over Flow, plus a frank account of what does not ship — no concrete transport and no Gradle wrapper.
+sidebar:
+  label: Kotlin
+  order: 5
+---
+
+Gradle root project `wasm-rpc-client`, Kotlin JVM plugin `2.1.0`.
+
+```kotlin
+import dev.prdlk.wasmrpc.WasmRpcTransport
+import dev.prdlk.wasmrpc.WasmRpcStreamTransport
+import dev.prdlk.wasmrpc.WasmRpcException
+```
+
+The package is `dev.prdlk.wasmrpc`, and that is what the code generator hardcodes
+into every generated import.
+
+:::note[Directory/package mismatch]
+The runtime source lives at
+`client/kotlin/src/main/kotlin/dev/hyperauth/wasmrpc/Transport.kt` but declares
+`package dev.prdlk.wasmrpc`. A repo-wide search for `hyperauth` finds zero
+content matches — the directory is a stale rename artifact. Kotlin does not
+enforce agreement, so it compiles, but every IDE warns. The **package name** is
+authoritative.
+:::
+
+## Build configuration
+
+```kotlin title="client/kotlin/build.gradle.kts"
+plugins {
+    kotlin("jvm") version "2.1.0"
+}
+
+repositories { mavenCentral() }
+
+dependencies {
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    implementation("com.google.protobuf:protobuf-kotlin:4.28.3")
+}
+
+// Generated sources from `buf generate`
+sourceSets["main"].java.srcDirs("gen/java", "gen/kotlin")
+```
+
+Both `gen/java` and `gen/kotlin` are folded into the main source set. `gen/java`
+supplies the protobuf **outer classes** the generated Kotlin clients reference.
+
+:::warning[Gaps in the build script]
+- **No Gradle wrapper.** No `gradlew`, no `gradle/wrapper/`. There is no pinned
+  distribution and no reproducible build from a clean checkout.
+- **No `group`, no `version`, no `maven-publish`.** It cannot be published as-is.
+- **Dependencies are `implementation`, but `Flow` is in the public API.**
+  `WasmRpcStreamTransport.listen` returns `Flow<ByteArray>`, so a downstream
+  consumer could not resolve `Flow`. These should be `api`, which also requires
+  the `java-library` plugin.
+- **No test source set** and no test dependencies.
+:::
+
+## Interfaces
+
+```kotlin title="client/kotlin/.../Transport.kt"
+interface WasmRpcTransport {
+    suspend fun invoke(method: String, payload: ByteArray): ByteArray
+}
+
+interface WasmRpcStreamTransport : WasmRpcTransport {
+    fun listen(method: String, payload: ByteArray): Flow<ByteArray>
+}
+```
+
+`listen` is deliberately **not** `suspend` — it returns a cold `Flow`, so nothing
+happens until collection. Documented contract: one frame per server message,
+completes on end, throws `WasmRpcException` on error, and collector cancellation
+cancels the underlying stream.
+
+## Errors
+
+```kotlin title="client/kotlin/.../Transport.kt:21-25"
+class WasmRpcException(
+    val code: String,
+    val method: String?,
+    message: String,
+) : Exception("$code: $message")
+```
+
+:::danger[`message` is not a property]
+`message` is a **constructor parameter only**. It is consumed to build the
+`Exception` message string, so the inherited `Throwable.message` reads
+`"invalid_argument: repeat must be <= 1000"` — the code prefixed in — and the
+bare message cannot be recovered.
+
+Dart and Swift keep `message` as a separate field. This is a real asymmetry: any
+cross-language error-formatting code will double-print the code in Kotlin.
+:::
+
+## No concrete transport ships
+
+`client/kotlin/src/main/kotlin/dev/hyperauth/wasmrpc/WebViewTransport.kt` contains
+**only a doc comment and no code**:
+
+```kotlin
+package dev.prdlk.wasmrpc
+
+/**
+ * Reference sketch for Android: bridge into a WebView hosting the Go
+ * Wasm module. Wire evaluateJavascript against `wasmRPC.invoke`,
+ * shuttling payloads as base64, and resume the continuation from the
+ * Promise callbacks. Host apps own the WebView lifecycle, so this stays
+ * an interface contract here rather than a concrete dependency.
+ */
+```
+
+There is no `class WebViewTransport`. The filename is misleading. The stated
+rationale is that host apps own the WebView lifecycle, so the runtime keeps this
+a contract rather than taking a dependency.
+
+## Implementing a transport
+
+You must supply the transport yourself. The shape for a `WebView` host, using
+`callbackFlow` so the teardown obligation is honored:
+
+```kotlin
+class WebViewTransport(private val webView: WebView) : WasmRpcStreamTransport {
+
+    override suspend fun invoke(method: String, payload: ByteArray): ByteArray =
+        suspendCancellableCoroutine { cont ->
+            // evaluateJavascript("wasmRPC.invoke(...)"), base64 the payload,
+            // resume from the Promise callbacks; on rejection resume with
+            // WasmRpcException(code, method, message)
+        }
+
+    override fun listen(method: String, payload: ByteArray): Flow<ByteArray> =
+        callbackFlow {
+            val id = /* evaluateJavascript("wasmRPC.listen(...)") -> stream id */ 0
+            // onMessage -> trySend(frame)
+            // onError   -> close(WasmRpcException(code, method, message))
+            // onEnd     -> close()
+            awaitClose { /* wasmRPC.cancel(id) */ }
+        }
+}
+```
+
+`awaitClose` is the important part: it is what turns coroutine cancellation into
+`wasmRPC.cancel(id)`, satisfying the interface's documented cancellation
+contract. Without it, cancelling the collector leaves the Go handler running.
+
+## Generated client shape
+
+```kotlin title="client/kotlin/gen/kotlin/echo/v1/EchoWasmClient.kt"
+package echo.v1
+
+import dev.prdlk.wasmrpc.WasmRpcTransport
+
+class EchoServiceClient(private val transport: WasmRpcTransport) {
+    suspend fun echo(request: Echo.EchoRequest): Echo.EchoResponse =
+        Echo.EchoResponse.parseFrom(
+            transport.invoke("echo.v1.EchoService/Echo", request.toByteArray()),
+        )
+}
+```
+
+```kotlin title="client/kotlin/gen/ticker/v1/TickerWasmClient.kt"
+class TickerServiceClient(private val transport: WasmRpcStreamTransport) {
+    fun subscribe(request: Ticker.SubscribeRequest): Flow<Ticker.SubscribeResponse> =
+        transport
+            .listen("ticker.v1.TickerService/Subscribe", request.toByteArray())
+            .map(Ticker.SubscribeResponse::parseFrom)
+}
+```
+
+Two things to note:
+
+- Messages are qualified by the Java **outer class** — `Echo.EchoRequest`,
+  `Ticker.SubscribeResponse` — because neither proto sets
+  `java_multiple_files`. Those outer classes come from `gen/java`, so a
+  Kotlin-only build without the Java plugin output will not compile.
+- The generated file is named from the proto **basename**, not the service:
+  `echo.proto` becomes `EchoWasmClient.kt`.
+
+The streaming file also imports `WasmRpcTransport` without using it — the
+generator emits both imports unconditionally. Harmless, but it trips `-Werror`
+and ktlint's no-unused-imports rule, which matters the moment you wire up CI.
+
+## Usage
+
+```kotlin
+val echo = EchoServiceClient(transport)
+val res = echo.echo(Echo.EchoRequest.newBuilder().setMessage("hi").setRepeat(2).build())
+
+val ticker = TickerServiceClient(transport)
+val job = scope.launch {
+    ticker.subscribe(req).collect { tick -> println("${tick.topic} #${tick.seq}") }
+}
+job.cancel() // cancels the Flow, and the transport must cancel the Go stream
+```
+
+:::warning[Not compiled here]
+Nothing in the Makefile builds or tests Kotlin, and there is no Gradle wrapper to
+do it with. The runtime and generated clients are descriptor-derived and
+unverified in this repository. Add a wrapper and a Gradle build to your own CI
+before depending on them.
+:::

@@ -1,0 +1,167 @@
+---
+title: TinyGo
+description: Why the vtprotobuf fast path is a correctness requirement, the two rules TinyGo imposes on handler code, and what the size numbers actually buy you.
+sidebar:
+  icon: feather
+---
+
+TinyGo cuts module size by roughly 5x. It also removes `recover()`, which changes
+how you must write handlers.
+
+## Sizes
+
+|                          | big Go   | TinyGo 0.38 |
+| ------------------------ | -------- | ----------- |
+| browser module size      | ~6.4 MB  | **~1.2 MB** |
+| wasip1 module size       | ~6.4 MB  | **~1.1 MB** |
+| unary + streams + cancel | ✅       | ✅          |
+| panic → `internal` error | ✅       | ❌ aborts   |
+
+:::note
+These figures come from the repository's README and example docs. No source file
+can confirm them, and they will move with your service's dependency graph. Treat
+them as an order of magnitude, not a guarantee — measure your own module.
+:::
+
+## Why vtprotobuf is mandatory, not optional
+
+`reflect.NewAt` inside `protobuf-go` crashes TinyGo. The router therefore asserts
+vtprotobuf's interfaces and bypasses reflection entirely when they are present:
+
+```go title="server/router.go:140-141"
+type vtMarshaler   interface{ MarshalVT() ([]byte, error) }
+type vtUnmarshaler interface{ UnmarshalVT([]byte) error }
+```
+
+`buf.gen.yaml:8-10` generates `features=marshal+unmarshal+size` for every message,
+so the fast path is always available here.
+
+:::danger[Do not drop the vtproto plugin]
+Without `MarshalVT`/`UnmarshalVT`, `marshalMessage` falls back to
+`proto.MarshalOptions{}.MarshalAppend`, which reaches reflection and aborts the
+module on TinyGo. It is not a performance regression — it is a runtime crash.
+
+On big Go the fast path is a free speed win, so there is no configuration where
+disabling it is correct.
+:::
+
+## Rule 1: never panic in a handler
+
+TinyGo cannot `recover()` on wasm with **any** scheduler — verified empirically.
+A panic aborts the whole module, taking every in-flight stream with it. There is no
+`internal` error and no `console.error` stack.
+
+```go
+// Wrong on TinyGo: aborts the module.
+func (s *Service) Echo(ctx context.Context, req *echov1.EchoRequest) (*echov1.EchoResponse, error) {
+	if req.GetRepeat() > 1000 {
+		panic("repeat too large")
+	}
+	// ...
+}
+
+// Right everywhere.
+func (s *Service) Echo(ctx context.Context, req *echov1.EchoRequest) (*echov1.EchoResponse, error) {
+	if req.GetRepeat() > 1000 {
+		return nil, server.Errorf(server.CodeInvalidArgument, "repeat must be <= 1000")
+	}
+	// ...
+}
+```
+
+This is why both TinyGo test targets skip the panic assertion — `SKIP_PANIC=1` for
+the Node harness, `--skip-panic` for the wazero host. Everything else in both
+suites runs identically.
+
+Note this applies to accidental panics too: a nil map write or an out-of-range
+index in a handler is fatal on TinyGo where it would be a typed `internal` error
+on big Go. Defensive coding earns more here than it does on big Go.
+
+## Rule 2: pace with `time.Sleep`
+
+Avoid `select` with `time.After` in a streaming handler. Use `time.Sleep`, which
+is portable to TinyGo's asyncify scheduler.
+
+```go
+// Portable — what examples/server-streaming/service.go does.
+for seq := uint32(1); seq <= count; seq++ {
+	if err := stream.Send(&tickerv1.SubscribeResponse{Seq: seq}); err != nil {
+		return err
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	time.Sleep(interval)
+}
+```
+
+Cancellation still works: `Send` returns an error as soon as the context is
+cancelled, and the explicit `ctx.Err()` check catches cancellation that lands
+during the sleep.
+
+## Building
+
+<Tabs>
+  <Tab title="Browser">
+
+```sh
+tinygo build -target=wasm -no-debug -o build/app.tinygo.wasm ./examples/e2e/wasm
+```
+
+Pair it with **TinyGo's own** glue script, not Go's:
+
+```sh
+$(tinygo env TINYGOROOT)/targets/wasm_exec.js
+```
+
+  </Tab>
+  <Tab title="WASI">
+
+```sh
+tinygo build -target=wasip1 -buildmode=c-shared -no-debug \
+  -o build/e2e.tinygo.wasip1.wasm ./examples/e2e/wasip1
+```
+
+No glue script needed — the host drives `_initialize` and the `wasmrpc_*` exports
+directly.
+
+  </Tab>
+</Tabs>
+
+Per-example convenience targets exist too:
+
+```sh
+make -C examples/server-basic wasm-tinygo
+make -C examples/server-basic wasip1-tinygo
+make -C examples/web-echo server-tinygo
+```
+
+## Testing
+
+```sh
+make test-e2e-tinygo       # 10/10, panic recovery skipped
+make test-wasip1-tinygo    # 4/4, panic recovery skipped
+```
+
+`make test-e2e-tinygo` sets all three env vars for you:
+
+```sh
+WASM_EXEC_JS=$(tinygo env TINYGOROOT)/targets/wasm_exec.js \
+WASM_MODULE=build/app.tinygo.wasm \
+SKIP_PANIC=1 \
+node examples/e2e/e2e.mjs
+```
+
+## Choosing
+
+Use TinyGo when
+: Module size is user-visible — a browser bundle on a cold cache, an embedded WASI
+  host, an edge runtime with a size limit.
+
+Use big Go when
+: You want panic recovery as a safety net, full standard-library support, or the
+  fastest build times during development.
+
+Either way, write handlers to the TinyGo rules. Returning `server.Errorf` instead
+of panicking and pacing with `time.Sleep` cost nothing on big Go, and they keep the
+TinyGo target open without a second code path.
